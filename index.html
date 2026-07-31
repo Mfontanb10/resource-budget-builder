@@ -1,0 +1,757 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8" />
+<meta name="viewport" content="width=device-width, initial-scale=1.0" />
+<title>Project Resource Budget Builder</title>
+<script src="https://cdnjs.cloudflare.com/ajax/libs/react/18.3.1/umd/react.production.min.js"></script>
+<script src="https://cdnjs.cloudflare.com/ajax/libs/react-dom/18.3.1/umd/react-dom.production.min.js"></script>
+<script src="https://cdnjs.cloudflare.com/ajax/libs/babel-standalone/7.24.7/babel.min.js"></script>
+<script src="https://cdnjs.cloudflare.com/ajax/libs/xlsx/0.18.5/xlsx.full.min.js"></script>
+<script src="https://cdn.tailwindcss.com"></script>
+<script>
+  tailwind.config = {
+    theme: {
+      extend: {
+        fontFamily: { sans: ["Inter", "system-ui", "sans-serif"] },
+      }
+    }
+  };
+</script>
+<link rel="preconnect" href="https://fonts.googleapis.com" />
+<link rel="preconnect" href="https://fonts.gstatic.com" crossorigin />
+<link href="https://fonts.googleapis.com/css2?family=Inter:wght@400;500;600;700;800;900&display=swap" rel="stylesheet" />
+<style>
+  body { font-family: 'Inter', system-ui, sans-serif; }
+  input[type=number]::-webkit-inner-spin-button,
+  input[type=number]::-webkit-outer-spin-button { opacity: 1; }
+</style>
+</head>
+<body class="bg-slate-50">
+<div id="root"></div>
+<script type="text/babel">
+const { useState, useEffect, useMemo } = React;
+
+// ─── CONSTANTS ───────────────────────────────────────────────────────────────
+const MONTHS_TO_WEEKS = 4.33;
+const TEAMS = ["Care", "Content", "SSO", "CDP", "CRM"];
+const CURRENCIES = ["EUR", "USD", "GBP"];
+const CURRENCY_SYMBOLS = { EUR: "€", USD: "$", GBP: "£" };
+const DURATION_UNITS = ["weeks", "months"];
+const ROLES = [
+  "Business Analyst","Scrum Master","Product Owner","Project Manager",
+  "Software Engineer","Front-End Engineer","Back-End Engineer","Full-Stack Engineer",
+  "Salesforce Engineer","QA Engineer","Test Automation Engineer","DevOps Engineer",
+  "Data Engineer","Solution Architect","Technical Architect","Enterprise Architect",
+  "UX/UI Designer","Data Analyst","Data Scientist","Security Specialist",
+  "Release Manager","Change Manager","Technical Writer","Other",
+];
+
+// ─── CALCULATION LOGIC ────────────────────────────────────────────────────────
+// Convert duration to weeks; months use the 4.33 factor
+function toWeeks(value, unit) {
+  const v = parseFloat(value) || 0;
+  return unit === "months" ? v * MONTHS_TO_WEEKS : v;
+}
+
+// Compute all derived fields for one resource
+function calcResource(resource, projectWeeks) {
+  const weeks = resource.useCustomDuration
+    ? toWeeks(resource.durationValue, resource.durationUnit)
+    : projectWeeks;
+  const hoursPerResource = (resource.hoursPerWeek || 0) * weeks;
+  const totalHours = (resource.quantity || 0) * hoursPerResource;
+  const costPerPerson = (resource.hourlyRate || 0) * hoursPerResource;
+  const totalCost = (resource.quantity || 0) * costPerPerson;
+  return { weeks, hoursPerResource, totalHours, costPerPerson, totalCost };
+}
+
+// ─── UTILITIES ────────────────────────────────────────────────────────────────
+let _idN = 0;
+function genId() { return `res_${Date.now()}_${_idN++}`; }
+
+function fmt(n, currency) {
+  const sym = CURRENCY_SYMBOLS[currency] || currency;
+  return `${sym}${Number(n || 0).toLocaleString("en-GB", { minimumFractionDigits: 2, maximumFractionDigits: 2 })}`;
+}
+function fmtNum(n) { return Number(n || 0).toLocaleString("en-GB"); }
+
+function sanitizeFilename(name) {
+  return name.replace(/[\\/:*?"<>|]/g, "_").trim() || "Project";
+}
+
+// ─── VALIDATION ───────────────────────────────────────────────────────────────
+function validate(project, resources) {
+  const errors = [];
+  if (!project.projectName.trim()) errors.push("Project name is required.");
+  if (!project.team) errors.push("Team selection is required.");
+  if (resources.length === 0) errors.push("At least one resource must be added.");
+  resources.forEach((r, i) => {
+    const label = `Resource ${i + 1}`;
+    if (!r.role) errors.push(`${label}: role is required.`);
+    if (r.role === "Other" && !r.customRole?.trim()) errors.push(`${label}: custom role description is required.`);
+    const rate = parseFloat(r.hourlyRate);
+    if (r.hourlyRate === "" || r.hourlyRate === undefined || r.hourlyRate === null) errors.push(`${label}: hourly rate is required.`);
+    else if (isNaN(rate) || rate < 0) errors.push(`${label}: hourly rate must be a non-negative number.`);
+    if (!r.hoursPerWeek || r.hoursPerWeek <= 0) errors.push(`${label}: hours per week must be greater than 0.`);
+    if (r.hoursPerWeek > 168) errors.push(`${label}: hours per week cannot exceed 168.`);
+    if (r.useCustomDuration && (!r.durationValue || r.durationValue <= 0)) errors.push(`${label}: custom duration must be greater than 0.`);
+  });
+  return errors;
+}
+
+// ─── EXCEL EXPORT ─────────────────────────────────────────────────────────────
+function exportToExcel(project, resources) {
+  const wb = XLSX.utils.book_new();
+  const projectWeeks = toWeeks(project.durationValue, project.durationUnit);
+  const sym = CURRENCY_SYMBOLS[project.currency] || project.currency;
+  const today = new Date().toISOString().slice(0, 10);
+
+  const totalHeadcount = resources.reduce((s, r) => s + (r.quantity || 0), 0);
+  const totalHours = resources.reduce((s, r) => s + calcResource(r, projectWeeks).totalHours, 0);
+  const totalCost = resources.reduce((s, r) => s + calcResource(r, projectWeeks).totalCost, 0);
+
+  // ── Sheet 1: Executive Summary ──
+  const summaryData = [
+    ["Project Resource Budget", ""],
+    ["", ""],
+    ["PROJECT INFORMATION", ""],
+    ["Project / Initiative Name", project.projectName],
+    ["Team", project.team],
+    ["Vendor / Delivery Partner", project.vendorName || "—"],
+    ["Start Date", project.startDate || "—"],
+    ["Description", project.description || "—"],
+    ["", ""],
+    ["PROJECT SCOPE", ""],
+    ["Project Duration", `${project.durationValue} ${project.durationUnit} (${projectWeeks.toFixed(2)} weeks)`],
+    ["Currency", project.currency],
+    ["Number of Resource Roles", resources.length],
+    ["Total Headcount", totalHeadcount],
+    ["Total Estimated Hours", parseFloat(totalHours.toFixed(2))],
+    ["", ""],
+    ["FINANCIAL SUMMARY", ""],
+    ["Total Estimated Project Cost", parseFloat(totalCost.toFixed(2))],
+    ["", ""],
+    ["Budget Generated On", today],
+  ];
+  const wsSum = XLSX.utils.aoa_to_sheet(summaryData);
+  wsSum["!cols"] = [{ wch: 34 }, { wch: 50 }];
+  XLSX.utils.book_append_sheet(wb, wsSum, "Executive Summary");
+
+  // ── Sheet 2: Resource Breakdown ──
+  const headers = [
+    "Resource Role","Custom Role","# Resources","Hourly Rate","Currency",
+    "Hrs/Week","Duration Value","Duration Unit","Duration (Weeks)",
+    "Hrs per Resource","Total Resource Hrs","Cost per Person","Total Role Cost","Notes"
+  ];
+  const rows = resources.map(r => {
+    const c = calcResource(r, projectWeeks);
+    const durVal = r.useCustomDuration ? r.durationValue : project.durationValue;
+    const durUnit = r.useCustomDuration ? r.durationUnit : project.durationUnit;
+    return [
+      r.role === "Other" ? "Other" : r.role,
+      r.role === "Other" ? (r.customRole || "") : "",
+      r.quantity,
+      parseFloat((r.hourlyRate || 0).toString()),
+      project.currency,
+      r.hoursPerWeek,
+      parseFloat(durVal),
+      durUnit,
+      parseFloat(c.weeks.toFixed(2)),
+      parseFloat(c.hoursPerResource.toFixed(2)),
+      parseFloat(c.totalHours.toFixed(2)),
+      parseFloat(c.costPerPerson.toFixed(2)),
+      parseFloat(c.totalCost.toFixed(2)),
+      r.notes || "",
+    ];
+  });
+  const totalsRow = [
+    "TOTALS","",totalHeadcount,"","","","","","",
+    "",parseFloat(totalHours.toFixed(2)),"",parseFloat(totalCost.toFixed(2)),""
+  ];
+  const breakdown = [headers, ...rows, [], totalsRow];
+  const wsBreak = XLSX.utils.aoa_to_sheet(breakdown);
+  wsBreak["!cols"] = [
+    {wch:24},{wch:18},{wch:13},{wch:13},{wch:10},
+    {wch:11},{wch:15},{wch:14},{wch:17},
+    {wch:17},{wch:18},{wch:16},{wch:16},{wch:32}
+  ];
+  wsBreak["!autofilter"] = { ref: `A1:N1` };
+  XLSX.utils.book_append_sheet(wb, wsBreak, "Resource Breakdown");
+
+  // ── Sheet 3: Assumptions ──
+  const assumptions = [
+    ["Assumptions & Methodology",""],
+    ["",""],
+    ["Assumption","Detail"],
+    ["Month definition","1 month = 4.33 weeks (365 days ÷ 12 months ÷ 7 days)"],
+    ["Hourly rates","Entered manually based on vendor quotations or internal rate cards"],
+    ["Taxes","Costs exclude taxes unless already included in the entered hourly rate"],
+    ["Other expenses","Costs exclude travel, licences, infrastructure, contingency, and other non-resource costs"],
+    ["Status","These are estimates and must be validated before financial approval"],
+    ["",""],
+    ["Formula Reference",""],
+    ["Resource Weeks","= Duration converted to weeks"],
+    ["Hours per Resource","= Hours per Week × Resource Weeks"],
+    ["Total Resource Hours","= Number of Resources × Hours per Resource"],
+    ["Cost per Resource Person","= Hourly Rate × Hours per Resource"],
+    ["Total Role Cost","= Number of Resources × Hourly Rate × Hours per Week × Resource Weeks"],
+    ["Total Project Cost","= Sum of all Total Role Costs"],
+    ["",""],
+    ["Generated by","Project Resource Budget Builder"],
+    ["Generated on", today],
+  ];
+  const wsAssump = XLSX.utils.aoa_to_sheet(assumptions);
+  wsAssump["!cols"] = [{ wch: 30 }, { wch: 65 }];
+  XLSX.utils.book_append_sheet(wb, wsAssump, "Assumptions");
+
+  const filename = `${sanitizeFilename(project.projectName)}_Resource_Budget_${today}.xlsx`;
+  XLSX.writeFile(wb, filename);
+  return filename;
+}
+
+// ─── DEFAULT STATE ────────────────────────────────────────────────────────────
+const defaultProject = {
+  projectName:"",team:"",vendorName:"",startDate:"",description:"",
+  currency:"EUR",durationValue:3,durationUnit:"months"
+};
+function defaultResource() {
+  return { id:genId(),role:"",customRole:"",quantity:1,hourlyRate:"",
+    hoursPerWeek:40,useCustomDuration:false,durationValue:1,durationUnit:"months",notes:"" };
+}
+
+// ─── SMALL UI PRIMITIVES ──────────────────────────────────────────────────────
+function Label({ children, required }) {
+  return (
+    <label className="block text-xs font-semibold text-slate-500 uppercase tracking-wide mb-1.5">
+      {children}{required && <span className="text-rose-500 ml-0.5">*</span>}
+    </label>
+  );
+}
+function Inp({ className="", ...p }) {
+  return <input className={`w-full rounded-lg border border-slate-200 bg-white px-3 py-2 text-sm text-slate-800 shadow-sm placeholder:text-slate-400 focus:border-blue-500 focus:outline-none focus:ring-2 focus:ring-blue-100 transition ${className}`} {...p} />;
+}
+function Sel({ className="", children, ...p }) {
+  return <select className={`w-full rounded-lg border border-slate-200 bg-white px-3 py-2 text-sm text-slate-800 shadow-sm focus:border-blue-500 focus:outline-none focus:ring-2 focus:ring-blue-100 transition ${className}`} {...p}>{children}</select>;
+}
+function Txta({ className="", rows=3, ...p }) {
+  return <textarea className={`w-full rounded-lg border border-slate-200 bg-white px-3 py-2 text-sm text-slate-800 shadow-sm placeholder:text-slate-400 focus:border-blue-500 focus:outline-none focus:ring-2 focus:ring-blue-100 transition resize-none ${className}`} rows={rows} {...p} />;
+}
+function Card({ children, className="" }) {
+  return <div className={`bg-white rounded-2xl border border-slate-100 shadow-sm p-6 ${className}`}>{children}</div>;
+}
+function SectionTitle({ children, sub }) {
+  return (
+    <div className="mb-5">
+      <h2 className="text-base font-bold text-slate-800 tracking-tight">{children}</h2>
+      {sub && <p className="text-xs text-slate-500 mt-0.5">{sub}</p>}
+    </div>
+  );
+}
+function IconBtn({ onClick, title, children, danger=false }) {
+  return (
+    <button onClick={onClick} title={title}
+      className={`p-1.5 rounded-lg transition ${danger?"text-rose-400 hover:bg-rose-50 hover:text-rose-600":"text-slate-400 hover:bg-slate-100 hover:text-slate-700"}`}>
+      {children}
+    </button>
+  );
+}
+
+// SVG icons (inline, no dependency)
+const IcoPlus = () => <svg className="w-4 h-4" fill="none" viewBox="0 0 24 24" stroke="currentColor" strokeWidth={2}><path strokeLinecap="round" strokeLinejoin="round" d="M12 4v16m8-8H4"/></svg>;
+const IcoTrash = () => <svg className="w-4 h-4" fill="none" viewBox="0 0 24 24" stroke="currentColor" strokeWidth={2}><path strokeLinecap="round" strokeLinejoin="round" d="M19 7l-.867 12.142A2 2 0 0116.138 21H7.862a2 2 0 01-1.995-1.858L5 7m5 4v6m4-6v6m1-10V4a1 1 0 00-1-1h-4a1 1 0 00-1 1v3M4 7h16"/></svg>;
+const IcoCopy = () => <svg className="w-4 h-4" fill="none" viewBox="0 0 24 24" stroke="currentColor" strokeWidth={2}><path strokeLinecap="round" strokeLinejoin="round" d="M8 16H6a2 2 0 01-2-2V6a2 2 0 012-2h8a2 2 0 012 2v2m-6 12h8a2 2 0 002-2v-8a2 2 0 00-2-2h-8a2 2 0 00-2 2v8a2 2 0 002 2z"/></svg>;
+const IcoDl = () => <svg className="w-4 h-4" fill="none" viewBox="0 0 24 24" stroke="currentColor" strokeWidth={2}><path strokeLinecap="round" strokeLinejoin="round" d="M4 16v1a3 3 0 003 3h10a3 3 0 003-3v-1m-4-4l-4 4m0 0l-4-4m4 4V4"/></svg>;
+const IcoReset = () => <svg className="w-4 h-4" fill="none" viewBox="0 0 24 24" stroke="currentColor" strokeWidth={2}><path strokeLinecap="round" strokeLinejoin="round" d="M4 4v5h.582m15.356 2A8.001 8.001 0 004.582 9m0 0H9m11 11v-5h-.581m0 0a8.003 8.003 0 01-15.357-2m15.357 2H15"/></svg>;
+const IcoChev = ({open}) => <svg className={`w-4 h-4 transition-transform ${open?"rotate-180":""}`} fill="none" viewBox="0 0 24 24" stroke="currentColor" strokeWidth={2}><path strokeLinecap="round" strokeLinejoin="round" d="M19 9l-7 7-7-7"/></svg>;
+const IcoCheck = () => <svg className="w-4 h-4" fill="none" viewBox="0 0 24 24" stroke="currentColor" strokeWidth={2}><path strokeLinecap="round" strokeLinejoin="round" d="M5 13l4 4L19 7"/></svg>;
+
+// ─── RESOURCE ROW ─────────────────────────────────────────────────────────────
+function ResourceRow({ resource, index, projectWeeks, currency, onUpdate, onDuplicate, onDelete }) {
+  const [expanded, setExpanded] = useState(true);
+  const [confirmDel, setConfirmDel] = useState(false);
+  const calc = calcResource(resource, projectWeeks);
+
+  function upd(field, value) { onUpdate({ ...resource, [field]: value }); }
+
+  const roleLabel = resource.role === "Other" && resource.customRole
+    ? resource.customRole
+    : resource.role || <span className="text-slate-400 italic text-xs">No role selected</span>;
+
+  return (
+    <div className="border border-slate-200 rounded-xl overflow-hidden bg-white shadow-sm">
+      {/* Accordion header */}
+      <div className="flex items-center gap-3 px-4 py-3 bg-slate-50 cursor-pointer select-none hover:bg-slate-100 transition"
+        onClick={() => setExpanded(e => !e)}>
+        <span className="flex-shrink-0 w-6 h-6 rounded-full bg-blue-600 text-white text-xs font-bold flex items-center justify-center leading-none">{index+1}</span>
+        <div className="flex-1 min-w-0">
+          <p className="text-sm font-semibold text-slate-800 truncate">{roleLabel}</p>
+          <p className="text-xs text-slate-500">
+            {resource.quantity > 1 ? `${resource.quantity} people · ` : ""}{fmtNum(Math.round(calc.totalHours))} hrs · <strong className="text-slate-700">{fmt(calc.totalCost, currency)}</strong>
+          </p>
+        </div>
+        <div className="flex items-center gap-1" onClick={e => e.stopPropagation()}>
+          <IconBtn onClick={onDuplicate} title="Duplicate resource"><IcoCopy /></IconBtn>
+          {confirmDel ? (
+            <div className="flex items-center gap-1">
+              <button onClick={onDelete} className="text-xs text-white bg-rose-500 hover:bg-rose-600 px-2 py-1 rounded-lg font-medium transition">Delete</button>
+              <button onClick={() => setConfirmDel(false)} className="text-xs text-slate-500 hover:text-slate-700 px-2 py-1 transition">Cancel</button>
+            </div>
+          ) : (
+            <IconBtn onClick={() => setConfirmDel(true)} title="Delete resource" danger><IcoTrash /></IconBtn>
+          )}
+        </div>
+        <IcoChev open={expanded} />
+      </div>
+
+      {/* Expanded body */}
+      {expanded && (
+        <div className="p-4 grid grid-cols-1 sm:grid-cols-2 lg:grid-cols-3 gap-4">
+          {/* Role select */}
+          <div>
+            <Label required>Resource Role</Label>
+            <Sel value={resource.role} onChange={e => upd("role", e.target.value)}>
+              <option value="">— Select role —</option>
+              {ROLES.map(r => <option key={r}>{r}</option>)}
+            </Sel>
+          </div>
+
+          {/* Custom role */}
+          {resource.role === "Other" && (
+            <div>
+              <Label required>Custom Role Name</Label>
+              <Inp type="text" value={resource.customRole}
+                onChange={e => upd("customRole", e.target.value)}
+                placeholder="e.g. Integration Specialist" />
+            </div>
+          )}
+
+          {/* Quantity */}
+          <div>
+            <Label required>Number of People</Label>
+            <Inp type="number" min={1} value={resource.quantity}
+              onChange={e => upd("quantity", Math.max(1, parseInt(e.target.value)||1))} />
+          </div>
+
+          {/* Hourly rate */}
+          <div>
+            <Label required>Hourly Rate ({currency})</Label>
+            <Inp type="number" min={0} step="0.01"
+              value={resource.hourlyRate}
+              onChange={e => upd("hourlyRate", e.target.value===""?"":parseFloat(e.target.value))}
+              placeholder="0.00" />
+          </div>
+
+          {/* Hours/week */}
+          <div>
+            <Label required>Hours per Week / Person</Label>
+            <Inp type="number" min={1} max={168} value={resource.hoursPerWeek}
+              onChange={e => upd("hoursPerWeek", Math.min(168, Math.max(0, parseInt(e.target.value)||0)))} />
+          </div>
+
+          {/* Custom duration toggle */}
+          <div className="sm:col-span-2 lg:col-span-3">
+            <label className="flex items-center gap-2 cursor-pointer select-none w-fit">
+              <input type="checkbox" checked={resource.useCustomDuration}
+                onChange={e => upd("useCustomDuration", e.target.checked)}
+                className="w-4 h-4 rounded border-slate-300 text-blue-600 focus:ring-blue-500" />
+              <span className="text-sm text-slate-600">Use a different duration for this resource</span>
+            </label>
+          </div>
+
+          {/* Custom duration inputs */}
+          {resource.useCustomDuration && (
+            <>
+              <div>
+                <Label required>Duration</Label>
+                <Inp type="number" min={0.5} step="0.5" value={resource.durationValue}
+                  onChange={e => upd("durationValue", parseFloat(e.target.value)||1)} />
+              </div>
+              <div>
+                <Label required>Unit</Label>
+                <Sel value={resource.durationUnit} onChange={e => upd("durationUnit", e.target.value)}>
+                  {DURATION_UNITS.map(u => <option key={u}>{u}</option>)}
+                </Sel>
+              </div>
+              <div className="flex items-end pb-1">
+                <span className="text-sm text-slate-500">= <span className="text-blue-700 font-bold">{calc.weeks.toFixed(2)} weeks</span></span>
+              </div>
+            </>
+          )}
+
+          {/* Notes */}
+          <div className="sm:col-span-2 lg:col-span-3">
+            <Label>Notes / Assumptions</Label>
+            <Txta value={resource.notes} rows={2}
+              onChange={e => upd("notes", e.target.value)}
+              placeholder="Seniority level, vendor, scope assumptions, caveats…" />
+          </div>
+
+          {/* Calculated summary bar */}
+          <div className="sm:col-span-2 lg:col-span-3 bg-slate-50 rounded-xl px-4 py-3 grid grid-cols-2 sm:grid-cols-4 gap-3 text-center mt-1">
+            {[
+              ["Duration", `${calc.weeks.toFixed(2)} wks`],
+              ["Hrs / Person", fmtNum(Math.round(calc.hoursPerResource))],
+              ["Total Hours", fmtNum(Math.round(calc.totalHours))],
+              ["Total Role Cost", fmt(calc.totalCost, currency)],
+            ].map(([label, val], i) => (
+              <div key={label}>
+                <p className="text-xs text-slate-500 mb-0.5">{label}</p>
+                <p className={`text-sm font-semibold ${i===3?"text-blue-700":"text-slate-800"}`}>{val}</p>
+              </div>
+            ))}
+          </div>
+        </div>
+      )}
+    </div>
+  );
+}
+
+// ─── APP ROOT ─────────────────────────────────────────────────────────────────
+function App() {
+  const [project, setProject] = useState(() => {
+    try { const s = localStorage.getItem("prbb_proj"); return s ? JSON.parse(s) : defaultProject; }
+    catch { return defaultProject; }
+  });
+  const [resources, setResources] = useState(() => {
+    try { const s = localStorage.getItem("prbb_res"); return s ? JSON.parse(s) : []; }
+    catch { return []; }
+  });
+  const [exportMsg, setExportMsg] = useState("");
+  const [confirmReset, setConfirmReset] = useState(false);
+
+  // Auto-save to localStorage
+  useEffect(() => {
+    try {
+      localStorage.setItem("prbb_proj", JSON.stringify(project));
+      localStorage.setItem("prbb_res", JSON.stringify(resources));
+    } catch {}
+  }, [project, resources]);
+
+  const projectWeeks = toWeeks(project.durationValue, project.durationUnit);
+  const errors = validate(project, resources);
+  const canExport = errors.length === 0;
+
+  const totalCost = useMemo(() => resources.reduce((s,r) => s + calcResource(r,projectWeeks).totalCost, 0), [resources,projectWeeks]);
+  const totalHours = useMemo(() => resources.reduce((s,r) => s + calcResource(r,projectWeeks).totalHours, 0), [resources,projectWeeks]);
+  const totalHeadcount = useMemo(() => resources.reduce((s,r) => s + (r.quantity||0), 0), [resources]);
+
+  function updProj(field, value) { setProject(p => ({...p, [field]:value})); }
+  function addResource() { setResources(rs => [...rs, defaultResource()]); }
+  function updateResource(id, updated) { setResources(rs => rs.map(r => r.id===id ? updated : r)); }
+  function duplicateResource(id) {
+    setResources(rs => {
+      const idx = rs.findIndex(r => r.id===id);
+      if (idx===-1) return rs;
+      const clone = {...rs[idx], id:genId()};
+      return [...rs.slice(0,idx+1), clone, ...rs.slice(idx+1)];
+    });
+  }
+  function deleteResource(id) { setResources(rs => rs.filter(r => r.id!==id)); }
+  function handleReset() {
+    setProject(defaultProject); setResources([]); setConfirmReset(false);
+    try { localStorage.removeItem("prbb_proj"); localStorage.removeItem("prbb_res"); } catch {}
+  }
+  function handleExport() {
+    if (!canExport) return;
+    try {
+      const fn = exportToExcel(project, resources);
+      setExportMsg(`✓ Exported: ${fn}`);
+      setTimeout(() => setExportMsg(""), 6000);
+    } catch (e) {
+      setExportMsg("Export failed — please try again.");
+      setTimeout(() => setExportMsg(""), 4000);
+    }
+  }
+
+  // Breakdown by role for summary
+  const roleBreakdown = useMemo(() => {
+    const map = {};
+    resources.forEach(r => {
+      const key = r.role==="Other" ? (r.customRole||"Other") : r.role;
+      if (!key) return;
+      if (!map[key]) map[key] = {quantity:0,totalHours:0,totalCost:0};
+      const c = calcResource(r,projectWeeks);
+      map[key].quantity += (r.quantity||0);
+      map[key].totalHours += c.totalHours;
+      map[key].totalCost += c.totalCost;
+    });
+    return Object.entries(map);
+  }, [resources,projectWeeks]);
+
+  return (
+    <div className="min-h-screen bg-slate-50 font-sans">
+      {/* ── HEADER ── */}
+      <header className="bg-white border-b border-slate-200 sticky top-0 z-20 shadow-sm">
+        <div className="max-w-6xl mx-auto px-4 sm:px-6 py-3.5 flex items-center justify-between gap-4 flex-wrap">
+          <div className="flex items-center gap-3">
+            <div className="w-8 h-8 rounded-lg bg-blue-600 flex items-center justify-center flex-shrink-0">
+              <svg className="w-4 h-4 text-white" fill="none" viewBox="0 0 24 24" stroke="currentColor" strokeWidth={2}>
+                <path strokeLinecap="round" strokeLinejoin="round" d="M9 7h6m0 10v-3m-3 3h.01M9 17h.01M9 11h.01M12 11h.01M15 11h.01M4 19h16a2 2 0 002-2V7a2 2 0 00-2-2H4a2 2 0 00-2 2v10a2 2 0 002 2z"/>
+              </svg>
+            </div>
+            <div>
+              <h1 className="text-sm font-bold text-slate-900 leading-tight">Project Resource Budget Builder</h1>
+              <p className="text-xs text-slate-500 hidden sm:block">Create a resource plan, estimate costs, and export to Excel.</p>
+            </div>
+          </div>
+          <div className="flex items-center gap-2 flex-wrap">
+            {confirmReset ? (
+              <div className="flex items-center gap-2">
+                <span className="text-xs text-slate-600">Reset everything?</span>
+                <button onClick={handleReset} className="text-xs text-white bg-rose-500 hover:bg-rose-600 px-3 py-1.5 rounded-lg font-medium transition">Yes, reset</button>
+                <button onClick={() => setConfirmReset(false)} className="text-xs text-slate-500 hover:text-slate-700 px-2 py-1.5 transition">Cancel</button>
+              </div>
+            ) : (
+              <button onClick={() => setConfirmReset(true)} className="flex items-center gap-1.5 text-xs text-slate-500 hover:text-slate-700 px-3 py-1.5 rounded-lg hover:bg-slate-100 transition font-medium">
+                <IcoReset />Reset
+              </button>
+            )}
+            <button onClick={handleExport} disabled={!canExport}
+              className={`flex items-center gap-1.5 text-xs font-semibold px-4 py-1.5 rounded-lg transition shadow-sm ${canExport?"bg-blue-600 text-white hover:bg-blue-700":"bg-slate-200 text-slate-400 cursor-not-allowed"}`}>
+              <IcoDl />Export to Excel
+            </button>
+          </div>
+        </div>
+      </header>
+
+      <main className="max-w-6xl mx-auto px-4 sm:px-6 py-8 space-y-6">
+        {/* Export message */}
+        {exportMsg && (
+          <div className={`flex items-center gap-2 px-4 py-3 rounded-xl text-sm font-medium ${exportMsg.startsWith("✓")?"bg-emerald-50 border border-emerald-200 text-emerald-700":"bg-rose-50 border border-rose-200 text-rose-700"}`}>
+            {exportMsg.startsWith("✓") && <IcoCheck />}
+            {exportMsg}
+          </div>
+        )}
+
+        {/* Validation banner – only show once resources exist */}
+        {errors.length > 0 && (resources.length > 0 || !project.projectName || !project.team) && (
+          <div className="bg-amber-50 border border-amber-200 rounded-xl px-4 py-3">
+            <p className="text-xs font-semibold text-amber-800 mb-1.5">Required before exporting:</p>
+            <ul className="space-y-0.5">
+              {errors.map((e,i) => <li key={i} className="text-xs text-amber-700 flex items-start gap-1"><span className="mt-0.5 opacity-60">·</span>{e}</li>)}
+            </ul>
+          </div>
+        )}
+
+        <div className="grid grid-cols-1 lg:grid-cols-3 gap-6 items-start">
+          {/* ── LEFT COLUMN: FORMS ── */}
+          <div className="lg:col-span-2 space-y-6">
+
+            {/* Project Information */}
+            <Card>
+              <SectionTitle sub="Basic details about the project or initiative.">Project Information</SectionTitle>
+              <div className="grid grid-cols-1 sm:grid-cols-2 gap-4">
+                <div className="sm:col-span-2">
+                  <Label required>Project / Initiative Name</Label>
+                  <Inp type="text" value={project.projectName}
+                    onChange={e => updProj("projectName", e.target.value)}
+                    placeholder="Enter the project or initiative name" />
+                </div>
+                <div>
+                  <Label required>Team</Label>
+                  <Sel value={project.team} onChange={e => updProj("team", e.target.value)}>
+                    <option value="">— Select team —</option>
+                    {TEAMS.map(t => <option key={t}>{t}</option>)}
+                  </Sel>
+                </div>
+                <div>
+                  <Label>Currency</Label>
+                  <Sel value={project.currency} onChange={e => updProj("currency", e.target.value)}>
+                    {CURRENCIES.map(c => <option key={c}>{c}</option>)}
+                  </Sel>
+                </div>
+                <div>
+                  <Label>Vendor / Delivery Partner</Label>
+                  <Inp type="text" value={project.vendorName}
+                    onChange={e => updProj("vendorName", e.target.value)}
+                    placeholder="Enter the vendor or delivery partner" />
+                </div>
+                <div>
+                  <Label>Project Start Date</Label>
+                  <Inp type="date" value={project.startDate} onChange={e => updProj("startDate", e.target.value)} />
+                </div>
+                <div className="sm:col-span-2">
+                  <Label>Project Description</Label>
+                  <Txta value={project.description}
+                    onChange={e => updProj("description", e.target.value)}
+                    placeholder="Brief summary of the project scope and objectives…" />
+                </div>
+              </div>
+            </Card>
+
+            {/* Project Duration */}
+            <Card>
+              <SectionTitle sub="Sets the default duration applied to all resources unless overridden.">Project Duration</SectionTitle>
+              <div className="grid grid-cols-2 sm:grid-cols-4 gap-4 items-end">
+                <div>
+                  <Label required>Duration</Label>
+                  <Inp type="number" min={0.5} step="0.5" value={project.durationValue}
+                    onChange={e => updProj("durationValue", parseFloat(e.target.value)||1)} />
+                </div>
+                <div>
+                  <Label required>Unit</Label>
+                  <Sel value={project.durationUnit} onChange={e => updProj("durationUnit", e.target.value)}>
+                    {DURATION_UNITS.map(u => <option key={u}>{u}</option>)}
+                  </Sel>
+                </div>
+                <div className="col-span-2">
+                  <div className="bg-blue-50 border border-blue-100 rounded-xl px-4 py-3 text-center">
+                    <p className="text-xs text-blue-600 font-medium mb-0.5">Total duration</p>
+                    <p className="text-xl font-black text-blue-700">{projectWeeks.toFixed(2)} <span className="text-sm font-medium">weeks</span></p>
+                    <p className="text-xs text-blue-400 mt-0.5">{project.durationValue} {project.durationUnit} × {project.durationUnit==="months"?"4.33":"1"}</p>
+                  </div>
+                </div>
+              </div>
+            </Card>
+
+            {/* Resource Planning */}
+            <Card>
+              <div className="flex items-start justify-between mb-5 gap-3">
+                <div>
+                  <h2 className="text-base font-bold text-slate-800 tracking-tight">Resource Planning</h2>
+                  <p className="text-xs text-slate-500 mt-0.5">Define each role, headcount, rate, and hours.</p>
+                </div>
+                <button onClick={addResource}
+                  className="flex-shrink-0 flex items-center gap-1.5 text-sm font-semibold text-white bg-blue-600 hover:bg-blue-700 px-4 py-2 rounded-xl transition shadow-sm">
+                  <IcoPlus />Add Resource
+                </button>
+              </div>
+
+              {resources.length === 0 ? (
+                <div className="border-2 border-dashed border-slate-200 rounded-xl p-10 text-center">
+                  <svg className="w-10 h-10 text-slate-300 mx-auto mb-3" fill="none" viewBox="0 0 24 24" stroke="currentColor" strokeWidth={1.5}>
+                    <path strokeLinecap="round" strokeLinejoin="round" d="M17 20h5v-2a3 3 0 00-5.356-1.857M17 20H7m10 0v-2c0-.656-.126-1.283-.356-1.857M7 20H2v-2a3 3 0 015.356-1.857M7 20v-2c0-.656.126-1.283.356-1.857m0 0a5.002 5.002 0 019.288 0M15 7a3 3 0 11-6 0 3 3 0 016 0zm6 3a2 2 0 11-4 0 2 2 0 014 0zM7 10a2 2 0 11-4 0 2 2 0 014 0z"/>
+                  </svg>
+                  <p className="text-sm font-semibold text-slate-500">No resources added yet</p>
+                  <p className="text-xs text-slate-400 mt-1 mb-5">Add roles to build your resource plan and estimate project costs.</p>
+                  <button onClick={addResource}
+                    className="inline-flex items-center gap-1.5 text-sm font-semibold text-white bg-blue-600 hover:bg-blue-700 px-5 py-2.5 rounded-xl transition shadow-sm">
+                    <IcoPlus />Add your first resource
+                  </button>
+                </div>
+              ) : (
+                <div className="space-y-3">
+                  {resources.map((r, i) => (
+                    <ResourceRow key={r.id} resource={r} index={i} projectWeeks={projectWeeks} currency={project.currency}
+                      onUpdate={updated => updateResource(r.id, updated)}
+                      onDuplicate={() => duplicateResource(r.id)}
+                      onDelete={() => deleteResource(r.id)} />
+                  ))}
+                  <button onClick={addResource}
+                    className="w-full flex items-center justify-center gap-1.5 text-sm text-slate-500 hover:text-blue-600 border border-dashed border-slate-300 hover:border-blue-400 rounded-xl py-3 transition font-medium">
+                    <IcoPlus />Add another resource
+                  </button>
+                </div>
+              )}
+            </Card>
+          </div>
+
+          {/* ── RIGHT COLUMN: SUMMARY ── */}
+          <div className="space-y-5 lg:sticky lg:top-20">
+            {/* Hero cost card */}
+            <div className="bg-gradient-to-br from-blue-600 to-blue-800 rounded-2xl p-6 text-white shadow-lg">
+              <p className="text-xs font-semibold uppercase tracking-widest text-blue-200 mb-2">Total Estimated Cost</p>
+              <p className="text-4xl font-black tracking-tight leading-none mb-2">{fmt(totalCost, project.currency)}</p>
+              <div className="flex items-center gap-3 text-xs text-blue-300 mt-1">
+                <span>{project.currency}</span>
+                <span>·</span>
+                <span>{fmtNum(Math.round(totalHours))} hours</span>
+                <span>·</span>
+                <span>{totalHeadcount} {totalHeadcount===1?"person":"people"}</span>
+              </div>
+            </div>
+
+            {/* Project summary */}
+            <Card>
+              <SectionTitle>Project Summary</SectionTitle>
+              <dl className="space-y-2.5 text-sm">
+                {[
+                  ["Project", project.projectName || <span className="text-slate-400 italic text-xs">Not entered</span>],
+                  ["Team", project.team
+                    ? <span className="inline-flex items-center px-2.5 py-0.5 rounded-full text-xs font-semibold bg-blue-50 text-blue-700 border border-blue-100">{project.team}</span>
+                    : <span className="text-slate-400 italic text-xs">Not selected</span>],
+                  ["Vendor", project.vendorName || "—"],
+                  ["Duration", `${project.durationValue} ${project.durationUnit} (${projectWeeks.toFixed(2)} wks)`],
+                  ["Start Date", project.startDate || "—"],
+                  ["Roles", resources.length],
+                  ["Headcount", totalHeadcount],
+                  ["Total Hours", fmtNum(Math.round(totalHours))],
+                ].map(([k, v]) => (
+                  <div key={k} className="flex justify-between items-start gap-2">
+                    <dt className="text-slate-500 flex-shrink-0">{k}</dt>
+                    <dd className="text-right font-medium text-slate-800">{v}</dd>
+                  </div>
+                ))}
+              </dl>
+            </Card>
+
+            {/* Cost by role */}
+            {roleBreakdown.length > 0 && (
+              <Card>
+                <SectionTitle>Cost by Role</SectionTitle>
+                <div className="overflow-x-auto -mx-1">
+                  <table className="w-full text-xs">
+                    <thead>
+                      <tr className="border-b border-slate-100">
+                        <th className="text-left text-slate-500 font-semibold pb-2 px-1">Role</th>
+                        <th className="text-right text-slate-500 font-semibold pb-2 px-1">Qty</th>
+                        <th className="text-right text-slate-500 font-semibold pb-2 px-1">Hrs</th>
+                        <th className="text-right text-slate-500 font-semibold pb-2 px-1">Cost</th>
+                      </tr>
+                    </thead>
+                    <tbody>
+                      {roleBreakdown.map(([role, d]) => (
+                        <tr key={role} className="border-b border-slate-50 hover:bg-slate-50 transition">
+                          <td className="py-2 text-slate-700 pr-2 px-1 max-w-[100px] truncate" title={role}>{role}</td>
+                          <td className="py-2 text-right text-slate-600 px-1">{d.quantity}</td>
+                          <td className="py-2 text-right text-slate-600 px-1">{fmtNum(Math.round(d.totalHours))}</td>
+                          <td className="py-2 text-right font-semibold text-slate-800 px-1">{fmt(d.totalCost, project.currency)}</td>
+                        </tr>
+                      ))}
+                    </tbody>
+                    <tfoot>
+                      <tr className="border-t-2 border-slate-200">
+                        <td className="pt-2.5 font-bold text-slate-800 px-1">Total</td>
+                        <td className="pt-2.5 text-right font-bold text-slate-800 px-1">{totalHeadcount}</td>
+                        <td className="pt-2.5 text-right font-bold text-slate-800 px-1">{fmtNum(Math.round(totalHours))}</td>
+                        <td className="pt-2.5 text-right font-bold text-blue-700 px-1">{fmt(totalCost, project.currency)}</td>
+                      </tr>
+                    </tfoot>
+                  </table>
+                </div>
+              </Card>
+            )}
+
+            {/* Export card */}
+            <Card>
+              <SectionTitle>Export Budget</SectionTitle>
+              {!canExport && errors.length > 0 && (
+                <div className="mb-3 bg-slate-50 rounded-lg px-3 py-2.5 text-xs text-slate-500 space-y-1">
+                  {errors.slice(0,4).map((e,i) => <p key={i} className="flex gap-1"><span className="opacity-50">·</span>{e}</p>)}
+                  {errors.length > 4 && <p className="opacity-60">…and {errors.length-4} more</p>}
+                </div>
+              )}
+              <button onClick={handleExport} disabled={!canExport}
+                className={`w-full flex items-center justify-center gap-2 text-sm font-semibold py-3 rounded-xl transition ${canExport?"bg-blue-600 text-white hover:bg-blue-700 shadow-sm":"bg-slate-100 text-slate-400 cursor-not-allowed"}`}>
+                <IcoDl />Generate Budget (.xlsx)
+              </button>
+              <p className="text-xs text-slate-400 mt-2.5 text-center leading-relaxed">
+                Creates 3 worksheets:<br/>Executive Summary · Resource Breakdown · Assumptions
+              </p>
+            </Card>
+          </div>
+        </div>
+      </main>
+
+      <footer className="mt-12 border-t border-slate-200 py-6 text-center text-xs text-slate-400">
+        Project Resource Budget Builder · Runs entirely in the browser · Progress auto-saved locally · No server required
+      </footer>
+    </div>
+  );
+}
+
+ReactDOM.createRoot(document.getElementById("root")).render(<App />);
+</script>
+</body>
+</html>
