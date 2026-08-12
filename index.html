@@ -112,13 +112,18 @@ function toWeeks(value, unit) {
   return unit === "months" ? v * MONTHS_TO_WEEKS : v;
 }
 function calcResource(resource, projectWeeks) {
-  const weeks = resource.useCustomDuration
+  const rawWeeks = resource.useCustomDuration
     ? toWeeks(resource.durationValue, resource.durationUnit)
     : projectWeeks;
-  const hoursPerResource = (resource.hoursPerWeek || 0) * weeks;
-  const totalHours       = (resource.quantity || 0) * hoursPerResource;
-  const costPerPerson    = (resource.hourlyRate || 0) * hoursPerResource;
-  const totalCost        = (resource.quantity || 0) * costPerPerson;
+  // Use actual weeks; 0 means no duration set yet — costs will be 0
+  const weeks = rawWeeks;
+  const qty   = parseFloat(resource.quantity)    || 0;
+  const rate  = parseFloat(resource.hourlyRate)  || 0;
+  const hpw   = parseFloat(resource.hoursPerWeek)|| 0;
+  const hoursPerResource = hpw * weeks;
+  const totalHours       = qty * hoursPerResource;
+  const costPerPerson    = rate * hoursPerResource;
+  const totalCost        = qty * costPerPerson;
   return { weeks, hoursPerResource, totalHours, costPerPerson, totalCost };
 }
 
@@ -417,7 +422,7 @@ async function exportToExcel(project, resources, integrationHub, devOps, newLice
 // ── DEFAULT STATE ─────────────────────────────────────────────────────────────
 const defaultProject = {
   projectName:"",team:"",vendorName:"",startDate:"",description:"",
-  currency:"EUR",durationValue:"",durationUnit:"months"
+  currency:"EUR",durationValue:3,durationUnit:"months"
 };
 function defaultResource() {
   return { id:genId(),role:"",customRole:"",quantity:"",hourlyRate:"",
@@ -613,22 +618,50 @@ function ResourceRow({ resource, index, projectWeeks, currency, onUpdate, onDupl
 // ── APP ────────────────────────────────────────────────────────────────────────
 function App() {
   const [project, setProject] = useState(() => {
-    try { const s=localStorage.getItem("prbb_proj"); return s?JSON.parse(s):defaultProject; } catch { return defaultProject; }
+    try {
+      const s = localStorage.getItem("prbb_proj");
+      if (!s) return defaultProject;
+      const p = JSON.parse(s);
+      const merged = {...defaultProject, ...p};
+      // if durationValue was stored as empty string from old version, use default
+      if (!merged.durationValue && merged.durationValue !== 0) merged.durationValue = 3;
+      return merged;
+    } catch { return defaultProject; }
   });
   const [resources, setResources] = useState(() => {
     try { const s=localStorage.getItem("prbb_res"); return s?JSON.parse(s):[]; } catch { return []; }
   });
   const [integrationHub, setIntegrationHub] = useState(() => {
-    try { const s=localStorage.getItem("prbb_integ"); return s?JSON.parse(s):defaultIntegrationHub; } catch { return defaultIntegrationHub; }
+    try {
+      const s = localStorage.getItem("prbb_integ");
+      if (!s) return defaultIntegrationHub;
+      const parsed = JSON.parse(s);
+      // Handle old format: was stored as boolean true/false
+      if (typeof parsed === "boolean") return {...defaultIntegrationHub, enabled: parsed};
+      if (typeof parsed === "object" && parsed !== null && "enabled" in parsed) return parsed;
+      return defaultIntegrationHub;
+    } catch { return defaultIntegrationHub; }
   });
   const [devOps, setDevOps] = useState(() => {
-    try { const s=localStorage.getItem("prbb_devops"); return s?JSON.parse(s):defaultDevOps; } catch { return defaultDevOps; }
+    try {
+      const s = localStorage.getItem("prbb_devops");
+      if (!s) return defaultDevOps;
+      const parsed = JSON.parse(s);
+      if (typeof parsed === "object" && parsed !== null && "enabled" in parsed) return parsed;
+      return defaultDevOps;
+    } catch { return defaultDevOps; }
   });
   const [newLicences, setNewLicences] = useState(() => {
     try { return localStorage.getItem("prbb_licences")||""; } catch { return ""; }
   });
   const [decommission, setDecommission] = useState(() => {
-    try { const s=localStorage.getItem("prbb_decom"); return s?JSON.parse(s):defaultDecommission; } catch { return defaultDecommission; }
+    try {
+      const s = localStorage.getItem("prbb_decom");
+      if (!s) return defaultDecommission;
+      const parsed = JSON.parse(s);
+      if (typeof parsed === "object" && parsed !== null && "enabled" in parsed) return parsed;
+      return defaultDecommission;
+    } catch { return defaultDecommission; }
   });
   const [exportMsg, setExportMsg] = useState("");
   const [confirmReset, setConfirmReset] = useState(false);
