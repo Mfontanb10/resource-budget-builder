@@ -83,7 +83,7 @@ const { useState, useEffect, useMemo } = React;
 
 // ── CONSTANTS ────────────────────────────────────────────────────────────────
 const MONTHS_TO_WEEKS = 4.33;
-const INTEGRATION_HUB_COST = 20000;
+const INTEGRATION_HUB_COST_PER = 20000;
 const TEAMS = ["Care","Content","SSO","CDP","CRM"];
 const CURRENCIES = ["EUR","USD","GBP"];
 const CURRENCY_SYMBOLS = { EUR:"€", USD:"$", GBP:"£" };
@@ -152,377 +152,280 @@ function validate(project, resources) {
   return e;
 }
 
-// ── EXCEL EXPORT ──────────────────────────────────────────────────────────────
-function cellStyle(bold=false, bg=null, color=null, sz=11, align="left", border=false) {
-  const s = { font:{ name:"Calibri", sz, bold, color: color?{rgb:color}:undefined },
-              alignment:{ horizontal:align, vertical:"center", wrapText:true } };
-  if (bg) s.fill = { patternType:"solid", fgColor:{ rgb:bg } };
-  if (border) s.border = {
-    top:{style:"thin",color:{rgb:"CCCCCC"}}, bottom:{style:"thin",color:{rgb:"CCCCCC"}},
-    left:{style:"thin",color:{rgb:"CCCCCC"}}, right:{style:"thin",color:{rgb:"CCCCCC"}}
-  };
-  return s;
-}
-
-function applyStyle(ws, ref, style) {
-  if (!ws[ref]) ws[ref] = { t:"z", v:"" };
-  ws[ref].s = style;
-}
-
-// ── EXCEL EXPORT (ExcelJS — full styling support) ────────────────────────────
-async function exportToExcel(project, resources, integrationHub) {
-  const projectWeeks   = toWeeks(project.durationValue, project.durationUnit);
-  const sym            = CURRENCY_SYMBOLS[project.currency] || project.currency;
-  const today          = new Date().toISOString().slice(0,10);
-  const totalHeadcount = resources.reduce((s,r) => s+(r.quantity||0), 0);
-  const totalHours     = resources.reduce((s,r) => s+calcResource(r,projectWeeks).totalHours, 0);
-  const resourceCost   = resources.reduce((s,r) => s+calcResource(r,projectWeeks).totalCost, 0);
-  const integrationCost = integrationHub ? INTEGRATION_HUB_COST : 0;
-  const totalCost      = resourceCost + integrationCost;
-  const currFmt        = `"${sym}"#,##0.00`;
-
-  // Reusable style helpers
-  const marsBlue = { argb:"FF00008B" };
-  const marsRed  = { argb:"FFCC0000" };
-  const marsDark = { argb:"FF000066" };
-  const white    = { argb:"FFFFFFFF" };
-  const lightBlue= { argb:"FFE8EEF7" };
-  const lightGrey= { argb:"FFF5F5F5" };
-  const midGrey  = { argb:"FFE0E0E0" };
-  const orange   = { argb:"FFFFF3E0" };
-  const darkText = { argb:"FF1A1A2E" };
-
-  function headerFont(sz=11)  { return { name:"Calibri", size:sz, bold:true,  color:white }; }
-  function bodyFont(sz=10,bold=false,italic=false) { return { name:"Calibri", size:sz, bold, italic }; }
-  function fill(color)        { return { type:"pattern", pattern:"solid", fgColor:color }; }
-  function thinBorder(color={ argb:"FFD0D0D0" }) {
-    const s = { style:"thin", color };
-    return { top:s, bottom:s, left:s, right:s };
-  }
-  function medBorder(topColor=marsRed) {
-    return { top:{ style:"medium", color:topColor } };
-  }
-
+// ── EXCEL EXPORT (ExcelJS) ────────────────────────────────────────────────────
+async function exportToExcel(project, resources, integrationHub, devOps, newLicences, decommission) {
   const wb = new ExcelJS.Workbook();
   wb.creator = "Mars Petcare Resource Budget Builder";
-  wb.created = new Date();
+  const projectWeeks = toWeeks(project.durationValue, project.durationUnit);
+  const currency = project.currency;
+  const sym = CURRENCY_SYMBOLS[currency] || currency;
+  const numFmt = `"${sym}"#,##0.00`;
 
-  // ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
-  // SHEET 1 — Executive Summary
-  // ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
-  const ws1 = wb.addWorksheet("Executive Summary");
-  ws1.columns = [{ width:38 },{ width:52 }];
+  // ─── helpers ───
+  const fill = (rgb) => ({ type:"pattern", pattern:"solid", fgColor:{argb:"FF"+rgb} });
+  const font = (bold=false, color="000000", sz=11) => ({ name:"Calibri", bold, size:sz, color:{argb:"FF"+color} });
+  const aln  = (h="left") => ({ horizontal:h, vertical:"middle", wrapText:true });
+  const border = (style="thin", color="CCCCCC") => ({
+    top:{style,color:{argb:"FF"+color}}, bottom:{style,color:{argb:"FF"+color}},
+    left:{style,color:{argb:"FF"+color}}, right:{style,color:{argb:"FF"+color}}
+  });
+  const setBorder = (cell, style="thin", color="CCCCCC") => { cell.border = border(style, color); };
 
-  function addSummaryRow(col1, col2, style) {
-    const row = ws1.addRow([col1, col2 !== undefined ? col2 : ""]);
-    row.height = 20;
-    if (style) {
-      row.eachCell({ includeEmpty:true }, cell => {
-        if (style.font)      cell.font      = style.font;
-        if (style.fill)      cell.fill      = style.fill;
-        if (style.alignment) cell.alignment = style.alignment;
-        if (style.border)    cell.border    = style.border;
-        if (style.numFmt && cell.col === 2) cell.numFmt = style.numFmt;
-      });
-    }
-    return row;
+  function hdr(ws, row, col, val, bgRgb, fgRgb="FFFFFF", bold=true, sz=11, hAlign="left") {
+    const cell = ws.getCell(row, col);
+    cell.value = val; cell.fill = fill(bgRgb);
+    cell.font = font(bold, fgRgb, sz); cell.alignment = aln(hAlign);
+    setBorder(cell, "thin", bgRgb === "FFFFFF" ? "CCCCCC" : bgRgb);
+    return cell;
+  }
+  function dat(ws, row, col, val, bgRgb="FFFFFF", fgRgb="222222", bold=false, numFmtStr=null) {
+    const cell = ws.getCell(row, col);
+    cell.value = val; cell.fill = fill(bgRgb);
+    cell.font = font(bold, fgRgb); cell.alignment = aln("left");
+    setBorder(cell);
+    if (numFmtStr) cell.numFmt = numFmtStr;
+    return cell;
+  }
+  function datR(ws, row, col, val, bgRgb="FFFFFF", fgRgb="222222", bold=false, numFmtStr=null) {
+    const cell = dat(ws, row, col, val, bgRgb, fgRgb, bold, numFmtStr);
+    cell.alignment = aln("right");
+    return cell;
+  }
+  function merge(ws, r1, c1, r2, c2) {
+    ws.mergeCells(r1, c1, r2, c2);
   }
 
-  // Title row
-  const r1 = ws1.addRow(["Mars Petcare – Resource Budget Estimation", ""]);
-  r1.height = 34;
-  r1.eachCell({ includeEmpty:true }, cell => {
-    cell.font = { name:"Calibri", size:18, bold:true, color:white };
-    cell.fill = fill(marsBlue);
-    cell.alignment = { vertical:"middle", horizontal:"left" };
-  });
+  const resourceCost = resources.reduce((s,r)=>s+calcResource(r,projectWeeks).totalCost,0);
+  const numInteg = integrationHub.enabled ? (parseInt(integrationHub.numIntegrations)||0) : 0;
+  const integCost = numInteg * INTEGRATION_HUB_COST_PER;
+  const devOpsCost = devOps.enabled && devOps.estimatedCost ? parseFloat(devOps.estimatedCost)||0 : 0;
+  const totalCost = resourceCost + integCost + devOpsCost;
 
-  // Subtitle
-  const r2 = ws1.addRow([
-    `Initiative: ${project.projectName||"—"}  |  Team: ${project.team||"—"}  |  Generated: ${today}`, ""
-  ]);
-  r2.height = 18;
-  r2.eachCell({ includeEmpty:true }, cell => {
-    cell.font = { name:"Calibri", size:10, color:white };
-    cell.fill = fill(marsDark);
-    cell.alignment = { vertical:"middle", horizontal:"left" };
-  });
-
-  ws1.addRow([]); // spacer
-
-  // Section: PROJECT INFORMATION
-  const secStyle = { font:headerFont(11), fill:fill(marsBlue), alignment:{ vertical:"middle" } };
-  addSummaryRow("PROJECT INFORMATION", "", secStyle);
-  addSummaryRow("Project / Initiative Name", project.projectName||"—");
-  addSummaryRow("Team", project.team||"—");
-  addSummaryRow("Vendor / Delivery Partner", project.vendorName||"—");
-  addSummaryRow("Start Date", project.startDate||"—");
-  addSummaryRow("Currency", project.currency);
-  addSummaryRow("Description", project.description||"—");
-  ws1.addRow([]);
-
-  // Section: PROJECT SCOPE
-  addSummaryRow("PROJECT SCOPE", "", secStyle);
-  addSummaryRow("Project Duration", `${project.durationValue} ${project.durationUnit} (${projectWeeks.toFixed(2)} weeks)`);
-  addSummaryRow("Number of Resource Roles", resources.length);
-  addSummaryRow("Total Headcount", totalHeadcount);
-  addSummaryRow("Total Estimated Hours", parseFloat(totalHours.toFixed(2)));
-  ws1.addRow([]);
-
-  // Section: COST SUMMARY
-  addSummaryRow("COST SUMMARY", "", secStyle);
-
-  // Resource cost row
-  const rcRow = ws1.addRow(["Resource Costs", parseFloat(resourceCost.toFixed(2))]);
-  rcRow.getCell(2).numFmt = currFmt;
-  rcRow.height = 20;
-
-  // Integration cost row
-  const icRow = ws1.addRow([
-    "Integration Hub (standard estimate)",
-    integrationHub ? parseFloat(integrationCost.toFixed(2)) : "Not included"
-  ]);
-  if (integrationHub) icRow.getCell(2).numFmt = currFmt;
-  icRow.height = 20;
-
-  // TOTAL row — red, large
-  const totRow = ws1.addRow(["TOTAL ESTIMATED COST", parseFloat(totalCost.toFixed(2))]);
-  totRow.height = 30;
-  totRow.eachCell({ includeEmpty:true }, cell => {
-    cell.font = { name:"Calibri", size:14, bold:true, color:white };
-    cell.fill = fill(marsRed);
-    cell.alignment = { vertical:"middle", horizontal: cell.col===1?"left":"right" };
-  });
-  totRow.getCell(2).numFmt = currFmt;
-  ws1.addRow([]);
-
-  // Disclaimer
-  addSummaryRow("DISCLAIMER", "", secStyle);
-  const discRow = ws1.addRow([
-    "This estimation was created using the Mars Petcare Resource Budget Builder. It represents a preliminary estimate based on manually entered rates and assumptions. Figures should be validated before formal financial approval.",
-    ""
-  ]);
-  ws1.mergeCells(`A${discRow.number}:B${discRow.number}`);
-  discRow.getCell(1).font  = { name:"Calibri", size:9, italic:true, color:{ argb:"FF555555" } };
-  discRow.getCell(1).alignment = { wrapText:true, vertical:"top" };
-  discRow.height = 40;
-  ws1.addRow([]);
-  addSummaryRow("Budget generated on", today);
-
-  // Alternate shading for info rows (rows 5-10)
-  [5,6,7,8,9,10,13,14,15,16].forEach(rn => {
-    const row = ws1.getRow(rn);
-    row.eachCell({ includeEmpty:true }, cell => {
-      if (!cell.fill || cell.fill.fgColor?.argb === "FF000000") {
-        cell.fill = fill(rn%2===0 ? lightGrey : { argb:"FFFFFFFF" });
-      }
-      cell.border = thinBorder();
-      cell.font = cell.font || bodyFont();
-      cell.alignment = cell.alignment || { vertical:"middle", wrapText:true };
-    });
-  });
-
-  // Freeze top 2 rows
-  ws1.views = [{ state:"frozen", ySplit:2 }];
-
-  // ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
-  // SHEET 2 — Resource Breakdown
-  // ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
-  const ws2 = wb.addWorksheet("Resource Breakdown");
-  ws2.columns = [
-    { header:"#",               key:"idx",     width:5  },
-    { header:"Resource Role",   key:"role",    width:26 },
-    { header:"Custom Role",     key:"custom",  width:18 },
-    { header:"People",          key:"qty",     width:9  },
-    { header:"Hourly Rate",     key:"rate",    width:13 },
-    { header:"Currency",        key:"curr",    width:10 },
-    { header:"Hrs/Week",        key:"hpw",     width:11 },
-    { header:"Duration Value",  key:"durval",  width:15 },
-    { header:"Duration Unit",   key:"durunit", width:14 },
-    { header:"Duration (Wks)",  key:"durwks",  width:15 },
-    { header:"Hrs/Person",      key:"hpp",     width:13 },
-    { header:"Total Hours",     key:"tothrs",  width:13 },
-    { header:"Cost/Person",     key:"cpp",     width:15 },
-    { header:"Total Role Cost", key:"trc",     width:17 },
-    { header:"Notes",           key:"notes",   width:34 },
+  // ═══ SHEET 1 — EXECUTIVE SUMMARY ════════════════════════════════════════════
+  const ws1 = wb.addWorksheet("Executive Summary");
+  ws1.columns = [
+    {width:32},{width:22},{width:18},{width:18}
   ];
 
-  // Style header row
-  const hdr = ws2.getRow(1);
-  hdr.height = 24;
-  hdr.eachCell({ includeEmpty:true }, cell => {
-    cell.font      = headerFont(11);
-    cell.fill      = fill(marsBlue);
-    cell.alignment = { horizontal:"center", vertical:"middle" };
-    cell.border    = { bottom:{ style:"medium", color:marsRed } };
+  let r = 1;
+  // Title bar
+  ws1.mergeCells(r,1,r,4);
+  const titleCell = ws1.getCell(r,1);
+  titleCell.value = "MARS PETCARE · RESOURCE BUDGET ESTIMATE";
+  titleCell.fill = fill(MARS_BLUE); titleCell.font = font(true,"FFFFFF",14);
+  titleCell.alignment = aln("center"); setBorder(titleCell,"thin",MARS_BLUE);
+  ws1.getRow(r).height = 32; r++;
+
+  // Subtitle
+  ws1.mergeCells(r,1,r,4);
+  const subCell = ws1.getCell(r,1);
+  subCell.value = project.projectName || "Project Budget";
+  subCell.fill = fill("1A1A8C"); subCell.font = font(false,"FFFFFF",11);
+  subCell.alignment = aln("center"); setBorder(subCell,"thin","1A1A8C");
+  ws1.getRow(r).height = 20; r++; r++;
+
+  // Project info section header
+  ws1.mergeCells(r,1,r,4);
+  hdr(ws1,r,1,"PROJECT INFORMATION",MARS_BLUE,"FFFFFF",true,10,"left");
+  ws1.getRow(r).height = 18; r++;
+
+  const projInfo = [
+    ["Project Name", project.projectName||"—"],
+    ["Team", project.team||"—"],
+    ["Vendor / Partner", project.vendorName||"—"],
+    ["Start Date", project.startDate||"—"],
+    ["Currency", currency],
+    ["Duration", project.durationValue&&project.durationUnit ? `${project.durationValue} ${project.durationUnit} (${projectWeeks.toFixed(2)} weeks)` : "—"],
+    ["Total Headcount", resources.reduce((s,r)=>s+(r.quantity||0),0)],
+    ["Total Hours", Math.round(resources.reduce((s,r)=>s+calcResource(r,projectWeeks).totalHours,0))],
+  ];
+  projInfo.forEach(([k,v],i)=>{
+    const bg = i%2===0?"FFFFFF":LIGHT_GREY;
+    dat(ws1,r,1,k,bg,"555555",true);
+    ws1.mergeCells(r,2,r,4);
+    dat(ws1,r,2,v,bg,"111111",false);
+    ws1.getRow(r).height = 18; r++;
+  });
+  r++;
+
+  // Cost summary section header
+  ws1.mergeCells(r,1,r,4);
+  hdr(ws1,r,1,"COST SUMMARY",MARS_BLUE,"FFFFFF",true,10,"left");
+  ws1.getRow(r).height = 18; r++;
+
+  const costRows = [["Resource Costs", resourceCost]];
+  if(integrationHub.enabled && numInteg>0) costRows.push([`Integration Hub (${numInteg} × ${sym}${(20000).toLocaleString()})`, integCost]);
+  if(devOps.enabled && devOpsCost>0) costRows.push(["DevOps Support", devOpsCost]);
+
+  costRows.forEach(([k,v],i)=>{
+    const bg = i%2===0?"FFFFFF":LIGHT_GREY;
+    dat(ws1,r,1,k,bg,"555555",false);
+    ws1.mergeCells(r,2,r,4);
+    datR(ws1,r,2,v,bg,"111111",false,numFmt);
+    ws1.getRow(r).height = 18; r++;
   });
 
-  // Data rows
-  resources.forEach((r, i) => {
-    const c   = calcResource(r, projectWeeks);
-    const dv  = r.useCustomDuration ? r.durationValue : project.durationValue;
-    const du  = r.useCustomDuration ? r.durationUnit  : project.durationUnit;
-    const bg  = i%2===0 ? lightGrey : { argb:"FFFFFFFF" };
-    const row = ws2.addRow({
-      idx:    i+1,
-      role:   r.role==="Other" ? "Other" : r.role,
-      custom: r.role==="Other" ? (r.customRole||"") : "",
-      qty:    r.quantity,
-      rate:   parseFloat((r.hourlyRate||0)),
-      curr:   project.currency,
-      hpw:    r.hoursPerWeek,
-      durval: parseFloat(dv),
-      durunit:du,
-      durwks: parseFloat(c.weeks.toFixed(2)),
-      hpp:    parseFloat(c.hoursPerResource.toFixed(2)),
-      tothrs: parseFloat(c.totalHours.toFixed(2)),
-      cpp:    parseFloat(c.costPerPerson.toFixed(2)),
-      trc:    parseFloat(c.totalCost.toFixed(2)),
-      notes:  r.notes||"",
-    });
-    row.height = 20;
-    row.eachCell({ includeEmpty:true }, cell => {
-      cell.fill   = fill(bg);
-      cell.border = thinBorder();
-      cell.font   = bodyFont(10);
-      cell.alignment = {
-        horizontal: ["role","custom","notes"].includes(cell.col) ? "left" : "center",
-        vertical:"middle"
-      };
-    });
-    // Currency format
-    ["rate","cpp","trc"].forEach(k => {
-      row.getCell(k).numFmt = currFmt;
-    });
-  });
+  // Total row
+  ws1.mergeCells(r,1,r,1);
+  const totLbl = ws1.getCell(r,1);
+  totLbl.value="TOTAL ESTIMATED COST"; totLbl.fill=fill(MARS_RED);
+  totLbl.font=font(true,"FFFFFF",12); totLbl.alignment=aln("left");
+  totLbl.border={top:{style:"medium",color:{argb:"FF"+MARS_RED}},bottom:{style:"medium",color:{argb:"FF"+MARS_RED}},left:{style:"medium",color:{argb:"FF"+MARS_RED}},right:{style:"thin",color:{argb:"FF"+MARS_RED}}};
+  ws1.mergeCells(r,2,r,4);
+  const totVal = ws1.getCell(r,2);
+  totVal.value=totalCost; totVal.fill=fill(MARS_RED);
+  totVal.font=font(true,"FFFFFF",12); totVal.alignment=aln("right");
+  totVal.numFmt=numFmt;
+  totVal.border={top:{style:"medium",color:{argb:"FF"+MARS_RED}},bottom:{style:"medium",color:{argb:"FF"+MARS_RED}},left:{style:"thin",color:{argb:"FF"+MARS_RED}},right:{style:"medium",color:{argb:"FF"+MARS_RED}}};
+  ws1.getRow(r).height = 24; r++; r++;
 
-  // Integration Hub row (if applicable)
-  if (integrationHub) {
-    const ir = ws2.addRow({
-      idx:"", role:"Integration Hub (Standard Estimate)", custom:"", qty:1,
-      rate:"", curr:"", hpw:"", durval:"", durunit:"", durwks:"",
-      hpp:"", tothrs:"", cpp:"",
-      trc: parseFloat(integrationCost.toFixed(2)),
-      notes:"Standard €20k estimate – pending discovery"
-    });
-    ir.height = 20;
-    ir.eachCell({ includeEmpty:true }, cell => {
-      cell.fill   = fill(orange);
-      cell.border = thinBorder();
-      cell.font   = bodyFont(10, false, true);
-      cell.alignment = { horizontal:"center", vertical:"middle" };
-    });
-    ir.getCell("role").alignment  = { horizontal:"left", vertical:"middle" };
-    ir.getCell("notes").alignment = { horizontal:"left", vertical:"middle" };
-    ir.getCell("trc").numFmt = currFmt;
+  // Optional sections
+  if(project.description) {
+    ws1.mergeCells(r,1,r,4); hdr(ws1,r,1,"PROJECT DESCRIPTION",MARS_BLUE,"FFFFFF",true,10); ws1.getRow(r).height=18; r++;
+    ws1.mergeCells(r,1,r,4);
+    const dc=ws1.getCell(r,1); dc.value=project.description; dc.fill=fill("FFFFFF");
+    dc.font=font(false,"333333"); dc.alignment={...aln("left"),wrapText:true};
+    setBorder(dc); ws1.getRow(r).height=48; r++; r++;
+  }
+  if(newLicences && newLicences.trim()) {
+    ws1.mergeCells(r,1,r,4); hdr(ws1,r,1,"NEW LICENCES REQUIRED",MARS_BLUE,"FFFFFF",true,10); ws1.getRow(r).height=18; r++;
+    ws1.mergeCells(r,1,r,4);
+    const lc=ws1.getCell(r,1); lc.value=newLicences; lc.fill=fill("FFFFFF");
+    lc.font=font(false,"333333"); lc.alignment={...aln("left"),wrapText:true};
+    setBorder(lc); ws1.getRow(r).height=40; r++; r++;
+  }
+  if(decommission.enabled && decommission.details) {
+    ws1.mergeCells(r,1,r,4); hdr(ws1,r,1,"PRODUCT / FEATURE DECOMMISSION",MARS_BLUE,"FFFFFF",true,10); ws1.getRow(r).height=18; r++;
+    ws1.mergeCells(r,1,r,4);
+    const dc2=ws1.getCell(r,1); dc2.value=decommission.details; dc2.fill=fill("FFFFFF");
+    dc2.font=font(false,"333333"); dc2.alignment={...aln("left"),wrapText:true};
+    setBorder(dc2); ws1.getRow(r).height=40; r++;
   }
 
-  ws2.addRow({}); // spacer
+  // ═══ SHEET 2 — RESOURCE BREAKDOWN ════════════════════════════════════════════
+  const ws2 = wb.addWorksheet("Resource Breakdown");
+  ws2.columns = [{width:28},{width:10},{width:14},{width:12},{width:12},{width:14},{width:14},{width:20}];
+  ws2.autoFilter = { from:{row:2,column:1}, to:{row:2,column:8} };
+
+  // Header row
+  ["Role","Qty","Hourly Rate","Hrs/Wk","Duration (wks)","Hrs (Total)","Cost","Notes"].forEach((h,ci)=>{
+    const cell = ws2.getCell(2,ci+1);
+    cell.value=h; cell.fill=fill(MARS_BLUE); cell.font=font(true,"FFFFFF");
+    cell.alignment=aln(ci>=5?"right":"left"); ws2.getRow(2).height=20;
+    cell.border={...border("thin",MARS_BLUE), bottom:{style:"medium",color:{argb:"FF"+MARS_RED}}};
+  });
+
+  let rr = 3;
+  resources.forEach((res,i)=>{
+    const c = calcResource(res, projectWeeks);
+    const bg = i%2===0?"FFFFFF":LIGHT_GREY;
+    const roleLabel = res.role==="Other"&&res.customRole ? res.customRole : res.role;
+    dat(ws2,rr,1,roleLabel,bg,"111111",true);
+    datR(ws2,rr,2,res.quantity||0,bg);
+    datR(ws2,rr,3,parseFloat(res.hourlyRate)||0,bg,"111111",false,numFmt);
+    datR(ws2,rr,4,res.hoursPerWeek||0,bg);
+    datR(ws2,rr,5,parseFloat(c.weeks.toFixed(2)),bg);
+    datR(ws2,rr,6,Math.round(c.totalHours),bg);
+    datR(ws2,rr,7,c.totalCost,bg,"111111",false,numFmt);
+    dat(ws2,rr,8,res.notes||"",bg,"555555");
+    ws2.getRow(rr).height=18; rr++;
+  });
+
+  if(integrationHub.enabled && numInteg>0) {
+    const iLabel = `Integration Hub (${numInteg} integration${numInteg>1?"s":""})`;
+    dat(ws2,rr,1,iLabel,"FFF3CD","7D4E00",true);
+    [2,3,4,5,6].forEach(c=>{const cell=ws2.getCell(rr,c);cell.value="—";cell.fill=fill("FFF3CD");cell.alignment=aln("right");cell.font=font(false,"7D4E00");setBorder(cell);});
+    datR(ws2,rr,7,integCost,"FFF3CD","7D4E00",true,numFmt);
+    dat(ws2,rr,8,`${numInteg} × ${sym}${(20000).toLocaleString("en-GB",{minimumFractionDigits:2})} / integration`,"FFF3CD","7D4E00");
+    ws2.getRow(rr).height=18; rr++;
+  }
+
+  if(devOps.enabled && devOpsCost>0) {
+    dat(ws2,rr,1,"DevOps Support","E8F5E9","1B5E20",true);
+    [2,3,4,5,6].forEach(c=>{const cell=ws2.getCell(rr,c);cell.value="—";cell.fill=fill("E8F5E9");cell.alignment=aln("right");cell.font=font(false,"1B5E20");setBorder(cell);});
+    datR(ws2,rr,7,devOpsCost,"E8F5E9","1B5E20",true,numFmt);
+    const dNote=devOps.duration?`Duration: ${devOps.duration}`:"";
+    dat(ws2,rr,8,dNote,"E8F5E9","1B5E20");
+    ws2.getRow(rr).height=18; rr++;
+  }
 
   // Totals row
-  const tr = ws2.addRow({
-    idx:"", role:"TOTALS", custom:"", qty:totalHeadcount,
-    rate:"", curr:"", hpw:"", durval:"", durunit:"", durwks:"",
-    hpp:"", tothrs:parseFloat(totalHours.toFixed(2)), cpp:"",
-    trc: parseFloat(totalCost.toFixed(2)), notes:""
+  [1,2,3,4,5,6,7,8].forEach(ci=>{
+    const cell=ws2.getCell(rr,ci);
+    cell.fill=fill(MARS_BLUE);
+    cell.font=font(true,"FFFFFF");
+    cell.border={top:{style:"medium",color:{argb:"FF"+MARS_RED}}, bottom:{style:"medium",color:{argb:"FF"+MARS_BLUE}}, left:{style:"thin",color:{argb:"FF"+MARS_BLUE}}, right:{style:"thin",color:{argb:"FF"+MARS_BLUE}}};
+    if(ci===1){cell.value="TOTAL"; cell.alignment=aln("left");}
+    else if(ci===2){cell.value=resources.reduce((s,r)=>s+(r.quantity||0),0); cell.alignment=aln("right");}
+    else if(ci===6){cell.value=Math.round(resources.reduce((s,r)=>s+calcResource(r,projectWeeks).totalHours,0)); cell.alignment=aln("right");}
+    else if(ci===7){cell.value=totalCost; cell.alignment=aln("right"); cell.numFmt=numFmt;}
+    else{cell.value=""; cell.alignment=aln("right");}
   });
-  tr.height = 26;
-  tr.eachCell({ includeEmpty:true }, cell => {
-    cell.font   = headerFont(12);
-    cell.fill   = fill(marsBlue);
-    cell.border = { top:{ style:"medium", color:marsRed } };
-    cell.alignment = { horizontal:"center", vertical:"middle" };
-  });
-  tr.getCell("role").alignment  = { horizontal:"left", vertical:"middle" };
-  tr.getCell("tothrs").numFmt   = "#,##0.00";
-  tr.getCell("trc").numFmt      = currFmt;
+  ws2.getRow(rr).height=22;
 
-  // Auto-filter on header row
-  ws2.autoFilter = { from:"A1", to:"O1" };
-  // Freeze header
-  ws2.views = [{ state:"frozen", ySplit:1 }];
-
-  // ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
-  // SHEET 3 — Assumptions
-  // ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+  // ═══ SHEET 3 — ASSUMPTIONS ═══════════════════════════════════════════════════
   const ws3 = wb.addWorksheet("Assumptions");
-  ws3.columns = [{ width:30 },{ width:70 }];
+  ws3.columns = [{width:32},{width:55}];
+  let ar=1;
+  ws3.mergeCells(ar,1,ar,2);
+  hdr(ws3,ar,1,"MARS PETCARE — BUDGET ASSUMPTIONS",MARS_BLUE,"FFFFFF",true,12,"center");
+  ws3.getRow(ar).height=28; ar++;ar++;
 
-  const t3 = ws3.addRow(["Mars Petcare – Budget Assumptions & Methodology", ""]);
-  t3.height = 28;
-  t3.eachCell({ includeEmpty:true }, cell => {
-    cell.font = { name:"Calibri", size:14, bold:true, color:white };
-    cell.fill = fill(marsBlue);
-    cell.alignment = { vertical:"middle" };
+  const assumptions = [
+    ["Estimation Method","Resource-based bottom-up estimation: roles × headcount × hourly rate × hours per week × duration."],
+    ["Hours per Week","Hours entered represent per-person, per-week effort. Total hours = qty × hrs/week × duration (weeks)."],
+    ["Month-to-Week Conversion",`1 month = ${MONTHS_TO_WEEKS} weeks (average working weeks per month).`],
+    ["Hourly Rate","Blended rate provided by Tech Lead. Inclusive of all fees unless stated otherwise in resource notes."],
+    ["Currency",`All costs are in ${currency}. Rates entered as ${currency} per hour.`],
+    ["Contingency","Budget does NOT include contingency unless explicitly added as a resource."],
+    ["Exclusions","Travel, expenses, training, software licences (unless listed separately), and infrastructure costs are excluded unless explicitly added."],
+    ["Status","This is an estimate for planning purposes only and is subject to revision after detailed discovery."],
+  ];
+  if(integrationHub.enabled && numInteg>0) {
+    assumptions.push(["Integration Hub", `Integration Hub team involvement is required for ${numInteg} integration${numInteg>1?"s":""} at ${sym}${(20000).toLocaleString("en-GB",{minimumFractionDigits:2})} per integration (standard estimate). Total: ${fmt(integCost,currency)}. This covers pre-discovery engagement and will be refined.`]);
+  }
+  if(devOps.enabled && devOpsCost>0) {
+    assumptions.push(["DevOps Support", `DevOps Support is required. Estimated cost: ${fmt(devOpsCost,currency)}.${devOps.duration?" Duration: "+devOps.duration+".":" "}`]);
+  }
+  if(newLicences && newLicences.trim()) {
+    assumptions.push(["New Licences", newLicences.trim()]);
+  }
+  if(decommission.enabled && decommission.details) {
+    assumptions.push(["Product Decommission", decommission.details.trim()]);
+  }
+
+  assumptions.forEach(([k,v],i)=>{
+    const bg=i%2===0?"FFFFFF":LIGHT_GREY;
+    const c1=ws3.getCell(ar,1); c1.value=k; c1.fill=fill(bg); c1.font=font(true,"333333"); c1.alignment={...aln("left"),wrapText:true}; setBorder(c1);
+    const c2=ws3.getCell(ar,2); c2.value=v; c2.fill=fill(bg); c2.font=font(false,"333333"); c2.alignment={...aln("left"),wrapText:true}; setBorder(c2);
+    ws3.getRow(ar).height=36; ar++;
   });
 
-  ws3.addRow([]);
-
-  const secStyle3 = { font:headerFont(), fill:fill(marsBlue) };
-
-  function addAssumpSec(title) {
-    const r = ws3.addRow([title, ""]);
-    r.height = 20;
-    r.eachCell({ includeEmpty:true }, cell => {
-      cell.font = secStyle3.font; cell.fill = secStyle3.fill;
-      cell.alignment = { vertical:"middle" };
-    });
-  }
-  function addAssumpRow(k, v, shade) {
-    const r = ws3.addRow([k, v]);
-    r.height = 20;
-    r.eachCell({ includeEmpty:true }, cell => {
-      cell.font = bodyFont(10);
-      cell.fill = fill(shade);
-      cell.border = thinBorder();
-      cell.alignment = { vertical:"middle", wrapText:true };
-    });
-    return r;
-  }
-
-  addAssumpSec("ASSUMPTIONS");
-  addAssumpRow("Month definition", "1 month = 4.33 weeks (365 days ÷ 12 months ÷ 7 days)", { argb:"FFFFFFFF" });
-  addAssumpRow("Hourly rates", "Based on vendor quotations or internal rate cards entered manually", lightGrey);
-  addAssumpRow("Taxes", "Costs exclude taxes unless already included in the entered rate", { argb:"FFFFFFFF" });
-  addAssumpRow("Other expenses", "Costs exclude travel, licences, infrastructure, and contingency", lightGrey);
-  addAssumpRow("Integration Hub", "Standard €20k estimate applies when Integration Hub team is required. Placeholder pending product discovery.", { argb:"FFFFFFFF" });
-  addAssumpRow("Validation", "All figures are preliminary estimates. Must be validated before financial approval.", lightGrey);
-  ws3.addRow([]);
-
-  addAssumpSec("FORMULA REFERENCE");
-  addAssumpRow("Resource Weeks",      "= Duration converted to weeks (months × 4.33)",                             { argb:"FFFFFFFF" });
-  addAssumpRow("Hours per Resource",  "= Hours per Week × Resource Weeks",                                         lightGrey);
-  addAssumpRow("Total Resource Hours","= Number of People × Hours per Resource",                                    { argb:"FFFFFFFF" });
-  addAssumpRow("Cost per Person",     "= Hourly Rate × Hours per Resource",                                         lightGrey);
-  addAssumpRow("Total Role Cost",     "= Number of People × Hourly Rate × Hours per Week × Resource Weeks",         { argb:"FFFFFFFF" });
-  addAssumpRow("Total Project Cost",  "= Sum of all Total Role Costs + Integration Hub cost (if applicable)",       lightGrey);
-  ws3.addRow([]);
-
-  addAssumpSec("ABOUT");
-  addAssumpRow("Generated by", "Mars Petcare Resource Budget Builder", { argb:"FFFFFFFF" });
-  addAssumpRow("Generated on", today, lightGrey);
-
-  // ── Write file ──────────────────────────────────────────────────────────────
-  const buffer = await wb.xlsx.writeBuffer();
-  const blob   = new Blob([buffer], { type:"application/vnd.openxmlformats-officedocument.spreadsheetml.sheet" });
-  const url    = URL.createObjectURL(blob);
-  const a      = document.createElement("a");
-  const filename = `${sanitize(project.projectName)}_Resource_Budget_${today}.xlsx`;
-  a.href = url; a.download = filename; a.click();
-  setTimeout(() => URL.revokeObjectURL(url), 5000);
-  return filename;
+  // Write file
+  const buf = await wb.xlsx.writeBuffer();
+  const blob = new Blob([buf], {type:"application/vnd.openxmlformats-officedocument.spreadsheetml.sheet"});
+  const url = URL.createObjectURL(blob);
+  const a = document.createElement("a");
+  const safeName = sanitize(project.projectName||"Budget");
+  const dateStr = new Date().toISOString().slice(0,10).replace(/-/g,"");
+  a.href=url; a.download=`MarsResourceBudget_${safeName}_${dateStr}.xlsx`;
+  document.body.appendChild(a); a.click();
+  document.body.removeChild(a); URL.revokeObjectURL(url);
+  return a.download;
 }
-
 
 // ── DEFAULT STATE ─────────────────────────────────────────────────────────────
 const defaultProject = {
   projectName:"",team:"",vendorName:"",startDate:"",description:"",
-  currency:"EUR",durationValue:3,durationUnit:"months"
+  currency:"EUR",durationValue:"",durationUnit:"months"
 };
 function defaultResource() {
-  return { id:genId(),role:"",customRole:"",quantity:1,hourlyRate:"",
-    hoursPerWeek:40,useCustomDuration:false,durationValue:1,durationUnit:"months",notes:"" };
+  return { id:genId(),role:"",customRole:"",quantity:"",hourlyRate:"",
+    hoursPerWeek:"",useCustomDuration:false,durationValue:1,durationUnit:"months",notes:"" };
 }
+const defaultIntegrationHub = { enabled:false, numIntegrations:"" };
+const defaultDevOps = { enabled:false, estimatedCost:"", duration:"" };
+const defaultDecommission = { enabled:false, details:"" };
 
 // ── UI PRIMITIVES ─────────────────────────────────────────────────────────────
 function Label({ children, required }) {
@@ -556,14 +459,12 @@ function IconBtn({ onClick, title, children, danger=false }) {
   return <button onClick={onClick} title={title}
     className={`p-1.5 rounded-lg transition ${danger?"text-red-400 hover:bg-red-50 hover:text-red-600":"text-slate-400 hover:bg-slate-100 hover:text-slate-600"}`}>{children}</button>;
 }
-
-// Toggle switch component
 function Toggle({ checked, onChange, label, sublabel }) {
   return (
     <div className="flex items-start gap-3">
       <button
         onClick={() => onChange(!checked)}
-        className={`relative flex-shrink-0 mt-0.5 w-11 h-6 rounded-full transition-colors duration-200 focus:outline-none focus:ring-2 focus:ring-blue-800 focus:ring-offset-2 ${checked ? "bg-mars-blue" : "bg-slate-300"}`}
+        className="relative flex-shrink-0 mt-0.5 w-11 h-6 rounded-full transition-colors duration-200 focus:outline-none focus:ring-2 focus:ring-blue-800 focus:ring-offset-2"
         style={{background: checked ? "#00008B" : "#CBD5E1"}}
         role="switch" aria-checked={checked}
       >
@@ -576,10 +477,7 @@ function Toggle({ checked, onChange, label, sublabel }) {
     </div>
   );
 }
-
-// Mars Petcare logo (SVG recreation — dark blue MARS, red Petcare)
 function MarsLogo({ size="sm" }) {
-  const scale = size === "sm" ? 1 : 1.4;
   return (
     <div style={{lineHeight:1, userSelect:"none"}}>
       <div style={{fontFamily:"Arial Black, Arial, sans-serif", fontWeight:900,
@@ -594,8 +492,6 @@ function MarsLogo({ size="sm" }) {
     </div>
   );
 }
-
-// SVG icons
 const IcoPlus  = () => <svg className="w-4 h-4" fill="none" viewBox="0 0 24 24" stroke="currentColor" strokeWidth={2}><path strokeLinecap="round" strokeLinejoin="round" d="M12 4v16m8-8H4"/></svg>;
 const IcoTrash = () => <svg className="w-4 h-4" fill="none" viewBox="0 0 24 24" stroke="currentColor" strokeWidth={2}><path strokeLinecap="round" strokeLinejoin="round" d="M19 7l-.867 12.142A2 2 0 0116.138 21H7.862a2 2 0 01-1.995-1.858L5 7m5 4v6m4-6v6m1-10V4a1 1 0 00-1-1h-4a1 1 0 00-1 1v3M4 7h16"/></svg>;
 const IcoCopy  = () => <svg className="w-4 h-4" fill="none" viewBox="0 0 24 24" stroke="currentColor" strokeWidth={2}><path strokeLinecap="round" strokeLinejoin="round" d="M8 16H6a2 2 0 01-2-2V6a2 2 0 012-2h8a2 2 0 012 2v2m-6 12h8a2 2 0 002-2v-8a2 2 0 00-2-2h-8a2 2 0 00-2 2v8a2 2 0 002 2z"/></svg>;
@@ -623,7 +519,7 @@ function ResourceRow({ resource, index, projectWeeks, currency, onUpdate, onDupl
         <div className="flex-1 min-w-0">
           <p className="text-sm font-semibold text-slate-800 truncate">{roleLabel}</p>
           <p className="text-xs text-slate-500">
-            {resource.quantity>1?`${resource.quantity} people · `:""}{fmtNum(Math.round(calc.totalHours))} hrs · <strong className="text-slate-700">{fmt(calc.totalCost,currency)}</strong>
+            {(resource.quantity||0)>1?`${resource.quantity} people · `:""}{fmtNum(Math.round(calc.totalHours))} hrs · <strong className="text-slate-700">{fmt(calc.totalCost,currency)}</strong>
           </p>
         </div>
         <div className="flex items-center gap-1" onClick={e=>e.stopPropagation()}>
@@ -656,17 +552,20 @@ function ResourceRow({ resource, index, projectWeeks, currency, onUpdate, onDupl
           )}
           <div>
             <Label required>Number of People</Label>
-            <Inp type="number" min={1} value={resource.quantity} onChange={e=>upd("quantity",Math.max(1,parseInt(e.target.value)||1))}/>
+            <Inp type="number" min={1} value={resource.quantity}
+              onChange={e=>upd("quantity", e.target.value===""?"":Math.max(1,parseInt(e.target.value)||1))}
+              placeholder="1"/>
           </div>
           <div>
             <Label required>Hourly Rate ({currency})</Label>
             <Inp type="number" min={0} step="0.01" value={resource.hourlyRate}
-              onChange={e=>upd("hourlyRate",e.target.value===""?"":parseFloat(e.target.value))} placeholder="0.00"/>
+              onChange={e=>upd("hourlyRate",e.target.value)} placeholder="0.00"/>
           </div>
           <div>
             <Label required>Hours per Week / Person</Label>
             <Inp type="number" min={1} max={168} value={resource.hoursPerWeek}
-              onChange={e=>upd("hoursPerWeek",Math.min(168,Math.max(0,parseInt(e.target.value)||0)))}/>
+              onChange={e=>upd("hoursPerWeek",e.target.value===""?"":Math.min(168,Math.max(0,parseInt(e.target.value)||0)))}
+              placeholder="40"/>
           </div>
           <div className="sm:col-span-2 lg:col-span-3">
             <label className="flex items-center gap-2 cursor-pointer select-none w-fit">
@@ -679,7 +578,7 @@ function ResourceRow({ resource, index, projectWeeks, currency, onUpdate, onDupl
             <>
               <div>
                 <Label required>Duration</Label>
-                <Inp type="number" min={0.5} step="0.5" value={resource.durationValue} onChange={e=>upd("durationValue",parseFloat(e.target.value)||1)}/>
+                <Inp type="number" min={0.5} step="0.5" value={resource.durationValue} onChange={e=>upd("durationValue",e.target.value===""?"":parseFloat(e.target.value)||1)}/>
               </div>
               <div>
                 <Label required>Unit</Label>
@@ -720,7 +619,16 @@ function App() {
     try { const s=localStorage.getItem("prbb_res"); return s?JSON.parse(s):[]; } catch { return []; }
   });
   const [integrationHub, setIntegrationHub] = useState(() => {
-    try { return localStorage.getItem("prbb_integ")==="true"; } catch { return false; }
+    try { const s=localStorage.getItem("prbb_integ"); return s?JSON.parse(s):defaultIntegrationHub; } catch { return defaultIntegrationHub; }
+  });
+  const [devOps, setDevOps] = useState(() => {
+    try { const s=localStorage.getItem("prbb_devops"); return s?JSON.parse(s):defaultDevOps; } catch { return defaultDevOps; }
+  });
+  const [newLicences, setNewLicences] = useState(() => {
+    try { return localStorage.getItem("prbb_licences")||""; } catch { return ""; }
+  });
+  const [decommission, setDecommission] = useState(() => {
+    try { const s=localStorage.getItem("prbb_decom"); return s?JSON.parse(s):defaultDecommission; } catch { return defaultDecommission; }
   });
   const [exportMsg, setExportMsg] = useState("");
   const [confirmReset, setConfirmReset] = useState(false);
@@ -729,32 +637,50 @@ function App() {
     try {
       localStorage.setItem("prbb_proj", JSON.stringify(project));
       localStorage.setItem("prbb_res",  JSON.stringify(resources));
-      localStorage.setItem("prbb_integ", String(integrationHub));
+      localStorage.setItem("prbb_integ", JSON.stringify(integrationHub));
+      localStorage.setItem("prbb_devops", JSON.stringify(devOps));
+      localStorage.setItem("prbb_licences", newLicences);
+      localStorage.setItem("prbb_decom", JSON.stringify(decommission));
     } catch {}
-  }, [project, resources, integrationHub]);
+  }, [project, resources, integrationHub, devOps, newLicences, decommission]);
 
   const projectWeeks    = toWeeks(project.durationValue, project.durationUnit);
   const errors          = validate(project, resources);
   const canExport       = errors.length === 0;
   const resourceCost    = useMemo(()=>resources.reduce((s,r)=>s+calcResource(r,projectWeeks).totalCost,0),[resources,projectWeeks]);
-  const integCost       = integrationHub ? INTEGRATION_HUB_COST : 0;
-  const totalCost       = resourceCost + integCost;
+  const numInteg        = integrationHub.enabled ? (parseInt(integrationHub.numIntegrations)||0) : 0;
+  const integCost       = numInteg * INTEGRATION_HUB_COST_PER;
+  const devOpsCost      = devOps.enabled && devOps.estimatedCost ? parseFloat(devOps.estimatedCost)||0 : 0;
+  const totalCost       = resourceCost + integCost + devOpsCost;
   const totalHours      = useMemo(()=>resources.reduce((s,r)=>s+calcResource(r,projectWeeks).totalHours,0),[resources,projectWeeks]);
-  const totalHeadcount  = useMemo(()=>resources.reduce((s,r)=>s+(r.quantity||0),0),[resources]);
+  const totalHeadcount  = useMemo(()=>resources.reduce((s,r)=>s+(parseInt(r.quantity)||0),0),[resources]);
 
   function updProj(f,v) { setProject(p=>({...p,[f]:v})); }
+  function updInteg(f,v){ setIntegrationHub(h=>({...h,[f]:v})); }
+  function updDevOps(f,v){ setDevOps(d=>({...d,[f]:v})); }
+  function updDecom(f,v){ setDecommission(d=>({...d,[f]:v})); }
   function addResource()      { setResources(rs=>[...rs,defaultResource()]); }
   function updateResource(id,u){ setResources(rs=>rs.map(r=>r.id===id?u:r)); }
   function duplicateResource(id){ setResources(rs=>{const i=rs.findIndex(r=>r.id===id);if(i===-1)return rs;const c={...rs[i],id:genId()};return [...rs.slice(0,i+1),c,...rs.slice(i+1)];}); }
   function deleteResource(id) { setResources(rs=>rs.filter(r=>r.id!==id)); }
+
   function handleReset() {
-    setProject(defaultProject); setResources([]); setIntegrationHub(false); setConfirmReset(false);
-    try { localStorage.removeItem("prbb_proj"); localStorage.removeItem("prbb_res"); localStorage.removeItem("prbb_integ"); } catch {}
+    setProject(defaultProject);
+    setResources([]);
+    setIntegrationHub(defaultIntegrationHub);
+    setDevOps(defaultDevOps);
+    setNewLicences("");
+    setDecommission(defaultDecommission);
+    setConfirmReset(false);
+    try {
+      ["prbb_proj","prbb_res","prbb_integ","prbb_devops","prbb_licences","prbb_decom"].forEach(k=>localStorage.removeItem(k));
+    } catch {}
   }
+
   async function handleExport() {
     if (!canExport) return;
     try {
-      const fn = await exportToExcel(project, resources, integrationHub);
+      const fn = await exportToExcel(project, resources, integrationHub, devOps, newLicences, decommission);
       setExportMsg(`✓ Exported: ${fn}`);
       setTimeout(()=>setExportMsg(""),6000);
     } catch(e) {
@@ -770,7 +696,7 @@ function App() {
       const k=r.role==="Other"?(r.customRole||"Other"):r.role; if(!k)return;
       if(!map[k])map[k]={quantity:0,totalHours:0,totalCost:0};
       const c=calcResource(r,projectWeeks);
-      map[k].quantity+=(r.quantity||0); map[k].totalHours+=c.totalHours; map[k].totalCost+=c.totalCost;
+      map[k].quantity+=(parseInt(r.quantity)||0); map[k].totalHours+=c.totalHours; map[k].totalCost+=c.totalCost;
     });
     return Object.entries(map);
   },[resources,projectWeeks]);
@@ -831,7 +757,6 @@ function App() {
       </div>
 
       <main className="max-w-6xl mx-auto px-4 sm:px-6 py-8 space-y-6">
-        {/* Export message */}
         {exportMsg && (
           <div className={`flex items-center gap-2 px-4 py-3 rounded-xl text-sm font-medium ${exportMsg.startsWith("✓")?"bg-emerald-50 border border-emerald-200 text-emerald-700":"bg-red-50 border border-red-200 text-red-700"}`}>
             {exportMsg.startsWith("✓")&&<IcoCheck/>}{exportMsg}
@@ -886,14 +811,16 @@ function App() {
 
             {/* Project Duration */}
             <Card>
-              <SectionTitle sub="Sets the default duration applied to all resources unless overridden.">Project Duration</SectionTitle>
+              <SectionTitle sub="Sets the default duration applied to all resources unless overridden. Optional.">Project Duration</SectionTitle>
               <div className="grid grid-cols-2 sm:grid-cols-4 gap-4 items-end">
                 <div>
-                  <Label required>Duration</Label>
-                  <Inp type="number" min={0.5} step="0.5" value={project.durationValue} onChange={e=>updProj("durationValue",parseFloat(e.target.value)||1)}/>
+                  <Label>Duration</Label>
+                  <Inp type="number" min={0} step="0.5" value={project.durationValue}
+                    onChange={e=>updProj("durationValue",e.target.value===""?"":parseFloat(e.target.value)||0)}
+                    placeholder="e.g. 3"/>
                 </div>
                 <div>
-                  <Label required>Unit</Label>
+                  <Label>Unit</Label>
                   <Sel value={project.durationUnit} onChange={e=>updProj("durationUnit",e.target.value)}>
                     {DURATION_UNITS.map(u=><option key={u}>{u}</option>)}
                   </Sel>
@@ -902,7 +829,7 @@ function App() {
                   <div className="rounded-xl px-4 py-3 text-center" style={{background:"#E8EEF7",border:"1px solid #C5D0E8"}}>
                     <p className="text-xs font-medium mb-0.5" style={{color:"#00008B"}}>Total duration</p>
                     <p className="text-xl font-black" style={{color:"#00008B"}}>{projectWeeks.toFixed(2)} <span className="text-sm font-medium">weeks</span></p>
-                    <p className="text-xs mt-0.5" style={{color:"#5570A0"}}>{project.durationValue} {project.durationUnit} × {project.durationUnit==="months"?"4.33":"1"}</p>
+                    <p className="text-xs mt-0.5" style={{color:"#5570A0"}}>{project.durationValue||0} {project.durationUnit} × {project.durationUnit==="months"?"4.33":"1"}</p>
                   </div>
                 </div>
               </div>
@@ -962,24 +889,131 @@ function App() {
                 </div>
               </div>
               <Toggle
-                checked={integrationHub}
-                onChange={setIntegrationHub}
+                checked={integrationHub.enabled}
+                onChange={v=>updInteg("enabled",v)}
                 label="Integration Hub team is required"
-                sublabel="A standard estimate of €20,000 will be added to the total budget. This covers the Integration Hub team's involvement prior to product discovery. The estimate will be refined in a later phase."
+                sublabel="Standard estimate: €20,000 per integration. This covers the Integration Hub team's involvement prior to product discovery. The estimate will be refined in a later phase."
               />
-              {integrationHub && (
-                <div className="mt-4 rounded-xl px-4 py-3 flex items-center justify-between gap-4" style={{background:"#E8EEF7",border:"1px solid #C5D0E8"}}>
-                  <div className="flex items-center gap-2">
-                    <IcoInfo/>
-                    <div>
-                      <p className="text-xs font-semibold" style={{color:"#00008B"}}>Integration Hub cost added</p>
-                      <p className="text-xs text-slate-500">Standard estimate · pending discovery</p>
-                    </div>
+              {integrationHub.enabled && (
+                <div className="mt-4 space-y-4">
+                  <div>
+                    <Label>Number of Integrations Required</Label>
+                    <Inp type="number" min={1} value={integrationHub.numIntegrations}
+                      onChange={e=>updInteg("numIntegrations",e.target.value===""?"":Math.max(1,parseInt(e.target.value)||1))}
+                      placeholder="e.g. 3"/>
+                    <p className="text-xs text-slate-400 mt-1">Each integration = €20,000 (standard estimate)</p>
                   </div>
-                  <p className="text-base font-black flex-shrink-0" style={{color:"#00008B"}}>{fmt(INTEGRATION_HUB_COST, project.currency)}</p>
+                  {numInteg>0 && (
+                    <div className="rounded-xl px-4 py-3 flex items-center justify-between gap-4" style={{background:"#E8EEF7",border:"1px solid #C5D0E8"}}>
+                      <div className="flex items-center gap-2">
+                        <IcoInfo/>
+                        <div>
+                          <p className="text-xs font-semibold" style={{color:"#00008B"}}>{numInteg} integration{numInteg>1?"s":""} · Integration Hub cost</p>
+                          <p className="text-xs text-slate-500">{numInteg} × €20,000 · standard estimate</p>
+                        </div>
+                      </div>
+                      <p className="text-base font-black flex-shrink-0" style={{color:"#00008B"}}>{fmt(integCost, project.currency)}</p>
+                    </div>
+                  )}
                 </div>
               )}
             </Card>
+
+            {/* ── DEVOPS SUPPORT ── */}
+            <Card>
+              <div className="flex items-start gap-3 mb-4">
+                <div className="w-8 h-8 rounded-lg flex items-center justify-center flex-shrink-0 mt-0.5" style={{background:"#E8EEF7"}}>
+                  <svg className="w-4 h-4" style={{color:"#00008B"}} fill="none" viewBox="0 0 24 24" stroke="currentColor" strokeWidth={2}>
+                    <path strokeLinecap="round" strokeLinejoin="round" d="M10.325 4.317c.426-1.756 2.924-1.756 3.35 0a1.724 1.724 0 002.573 1.066c1.543-.94 3.31.826 2.37 2.37a1.724 1.724 0 001.065 2.572c1.756.426 1.756 2.924 0 3.35a1.724 1.724 0 00-1.066 2.573c.94 1.543-.826 3.31-2.37 2.37a1.724 1.724 0 00-2.572 1.065c-.426 1.756-2.924 1.756-3.35 0a1.724 1.724 0 00-2.573-1.066c-1.543.94-3.31-.826-2.37-2.37a1.724 1.724 0 00-1.065-2.572c-1.756-.426-1.756-2.924 0-3.35a1.724 1.724 0 001.066-2.573c-.94-1.543.826-3.31 2.37-2.37.996.608 2.296.07 2.572-1.065z"/><path strokeLinecap="round" strokeLinejoin="round" d="M15 12a3 3 0 11-6 0 3 3 0 016 0z"/>
+                  </svg>
+                </div>
+                <div>
+                  <h2 className="text-base font-bold text-slate-800">DevOps Support</h2>
+                  <p className="text-xs text-slate-500 mt-0.5">Is DevOps team involvement required for this initiative?</p>
+                </div>
+              </div>
+              <Toggle
+                checked={devOps.enabled}
+                onChange={v=>updDevOps("enabled",v)}
+                label="DevOps Support is required"
+                sublabel="Optional — fill in the details below if known. Leave blank if not yet determined."
+              />
+              {devOps.enabled && (
+                <div className="mt-4 grid grid-cols-1 sm:grid-cols-2 gap-4">
+                  <div>
+                    <Label>Estimated DevOps Cost ({project.currency})</Label>
+                    <Inp type="number" min={0} step="100" value={devOps.estimatedCost}
+                      onChange={e=>updDevOps("estimatedCost",e.target.value)}
+                      placeholder="Optional — e.g. 5000"/>
+                    <p className="text-xs text-slate-400 mt-1">Leave blank if unknown — not mandatory</p>
+                  </div>
+                  <div>
+                    <Label>Estimated Duration</Label>
+                    <Inp type="text" value={devOps.duration}
+                      onChange={e=>updDevOps("duration",e.target.value)}
+                      placeholder="Optional — e.g. 2 months"/>
+                    <p className="text-xs text-slate-400 mt-1">Leave blank if unknown — not mandatory</p>
+                  </div>
+                  {devOpsCost>0 && (
+                    <div className="sm:col-span-2 rounded-xl px-4 py-3 flex items-center justify-between gap-4" style={{background:"#E8EEF7",border:"1px solid #C5D0E8"}}>
+                      <div className="flex items-center gap-2">
+                        <IcoInfo/>
+                        <p className="text-xs font-semibold" style={{color:"#00008B"}}>DevOps Support cost added</p>
+                      </div>
+                      <p className="text-base font-black flex-shrink-0" style={{color:"#00008B"}}>{fmt(devOpsCost, project.currency)}</p>
+                    </div>
+                  )}
+                </div>
+              )}
+            </Card>
+
+            {/* ── NEW LICENCES ── */}
+            <Card>
+              <div className="flex items-start gap-3 mb-4">
+                <div className="w-8 h-8 rounded-lg flex items-center justify-center flex-shrink-0 mt-0.5" style={{background:"#E8EEF7"}}>
+                  <svg className="w-4 h-4" style={{color:"#00008B"}} fill="none" viewBox="0 0 24 24" stroke="currentColor" strokeWidth={2}>
+                    <path strokeLinecap="round" strokeLinejoin="round" d="M9 12h6m-6 4h6m2 5H7a2 2 0 01-2-2V5a2 2 0 012-2h5.586a1 1 0 01.707.293l5.414 5.414a1 1 0 01.293.707V19a2 2 0 01-2 2z"/>
+                  </svg>
+                </div>
+                <div>
+                  <h2 className="text-base font-bold text-slate-800">New Licences Required</h2>
+                  <p className="text-xs text-slate-500 mt-0.5">Are any new platform or product licences needed to fulfil this business need? <span className="text-slate-400">(Optional)</span></p>
+                </div>
+              </div>
+              <Txta value={newLicences} rows={3}
+                onChange={e=>setNewLicences(e.target.value)}
+                placeholder="e.g. Salesforce Marketing Cloud licence (10 seats), Adobe Analytics enterprise tier…"/>
+            </Card>
+
+            {/* ── PRODUCT DECOMMISSION ── */}
+            <Card>
+              <div className="flex items-start gap-3 mb-4">
+                <div className="w-8 h-8 rounded-lg flex items-center justify-center flex-shrink-0 mt-0.5" style={{background:"#FEF3C7"}}>
+                  <svg className="w-4 h-4 text-amber-600" fill="none" viewBox="0 0 24 24" stroke="currentColor" strokeWidth={2}>
+                    <path strokeLinecap="round" strokeLinejoin="round" d="M19 7l-.867 12.142A2 2 0 0116.138 21H7.862a2 2 0 01-1.995-1.858L5 7m5 4v6m4-6v6m1-10V4a1 1 0 00-1-1h-4a1 1 0 00-1 1v3M4 7h16"/>
+                  </svg>
+                </div>
+                <div>
+                  <h2 className="text-base font-bold text-slate-800">Product Decommission</h2>
+                  <p className="text-xs text-slate-500 mt-0.5">Will any product or feature be retired as a consequence of this initiative? <span className="text-slate-400">(Optional)</span></p>
+                </div>
+              </div>
+              <Toggle
+                checked={decommission.enabled}
+                onChange={v=>updDecom("enabled",v)}
+                label="A product or feature will be decommissioned"
+                sublabel="Optional — enable if applicable and specify below."
+              />
+              {decommission.enabled && (
+                <div className="mt-4">
+                  <Label>Which product / feature will be decommissioned?</Label>
+                  <Txta value={decommission.details} rows={2}
+                    onChange={e=>updDecom("details",e.target.value)}
+                    placeholder="e.g. Legacy loyalty platform (Comarch) will be sunset in Q4 2025…"/>
+                </div>
+              )}
+            </Card>
+
           </div>
 
           {/* ── RIGHT: SUMMARY ── */}
@@ -993,9 +1027,14 @@ function App() {
                 <span>{fmtNum(Math.round(totalHours))} hours</span><span>·</span>
                 <span>{totalHeadcount} {totalHeadcount===1?"person":"people"}</span>
               </div>
-              {integrationHub && (
+              {integrationHub.enabled && numInteg>0 && (
                 <div className="mt-3 pt-3 border-t border-white border-opacity-20 text-xs" style={{color:"#93A8D4"}}>
-                  Includes {fmt(INTEGRATION_HUB_COST, project.currency)} Integration Hub estimate
+                  Includes {fmt(integCost, project.currency)} Integration Hub ({numInteg} integration{numInteg>1?"s":""})
+                </div>
+              )}
+              {devOps.enabled && devOpsCost>0 && (
+                <div className="mt-1 text-xs" style={{color:"#93A8D4"}}>
+                  + {fmt(devOpsCost, project.currency)} DevOps Support
                 </div>
               )}
             </div>
@@ -1010,14 +1049,23 @@ function App() {
                     ? <span className="inline-flex items-center px-2.5 py-0.5 rounded-full text-xs font-semibold border" style={{background:"#E8EEF7",color:"#00008B",borderColor:"#C5D0E8"}}>{project.team}</span>
                     : <span className="text-slate-400 italic text-xs">Not selected</span>],
                   ["Vendor", project.vendorName||"—"],
-                  ["Duration", `${project.durationValue} ${project.durationUnit} (${projectWeeks.toFixed(2)} wks)`],
+                  ["Duration", projectWeeks>0?`${project.durationValue} ${project.durationUnit} (${projectWeeks.toFixed(2)} wks)`:"—"],
                   ["Start Date", project.startDate||"—"],
                   ["Roles", resources.length],
                   ["Headcount", totalHeadcount],
                   ["Total Hours", fmtNum(Math.round(totalHours))],
-                  ["Integration Hub", integrationHub
-                    ? <span className="inline-flex items-center px-2.5 py-0.5 rounded-full text-xs font-semibold border" style={{background:"#E8EEF7",color:"#00008B",borderColor:"#C5D0E8"}}>Yes — {fmt(INTEGRATION_HUB_COST,project.currency)}</span>
+                  ["Integration Hub", integrationHub.enabled&&numInteg>0
+                    ? <span className="inline-flex items-center px-2.5 py-0.5 rounded-full text-xs font-semibold border" style={{background:"#E8EEF7",color:"#00008B",borderColor:"#C5D0E8"}}>{numInteg} integration{numInteg>1?"s":""} — {fmt(integCost,project.currency)}</span>
                     : <span className="text-slate-400 text-xs">Not required</span>],
+                  ["DevOps Support", devOps.enabled
+                    ? <span className="inline-flex items-center px-2.5 py-0.5 rounded-full text-xs font-semibold border" style={{background:"#E8EEF7",color:"#00008B",borderColor:"#C5D0E8"}}>{devOpsCost>0?fmt(devOpsCost,project.currency):"Required"}</span>
+                    : <span className="text-slate-400 text-xs">Not required</span>],
+                  ["New Licences", newLicences.trim()
+                    ? <span className="text-xs text-slate-700">Specified</span>
+                    : <span className="text-slate-400 text-xs">None specified</span>],
+                  ["Decommission", decommission.enabled
+                    ? <span className="inline-flex items-center px-2.5 py-0.5 rounded-full text-xs font-semibold border" style={{background:"#FEF3C7",color:"#92400E",borderColor:"#FCD34D"}}>Yes</span>
+                    : <span className="text-slate-400 text-xs">None</span>],
                 ].map(([k,v])=>(
                   <div key={k} className="flex justify-between items-start gap-2">
                     <dt className="text-slate-500 flex-shrink-0">{k}</dt>
@@ -1050,10 +1098,16 @@ function App() {
                           <td className="py-2 text-right font-semibold text-slate-800 px-1">{fmt(d.totalCost,project.currency)}</td>
                         </tr>
                       ))}
-                      {integrationHub && (
+                      {integrationHub.enabled && numInteg>0 && (
                         <tr className="border-b border-slate-50">
-                          <td className="py-2 text-slate-500 italic px-1" colSpan={3}>Integration Hub</td>
-                          <td className="py-2 text-right font-semibold text-slate-800 px-1">{fmt(INTEGRATION_HUB_COST,project.currency)}</td>
+                          <td className="py-2 text-slate-500 italic px-1" colSpan={3}>Integration Hub ({numInteg}×)</td>
+                          <td className="py-2 text-right font-semibold text-slate-800 px-1">{fmt(integCost,project.currency)}</td>
+                        </tr>
+                      )}
+                      {devOps.enabled && devOpsCost>0 && (
+                        <tr className="border-b border-slate-50">
+                          <td className="py-2 text-slate-500 italic px-1" colSpan={3}>DevOps Support</td>
+                          <td className="py-2 text-right font-semibold text-slate-800 px-1">{fmt(devOpsCost,project.currency)}</td>
                         </tr>
                       )}
                     </tbody>
